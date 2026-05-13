@@ -1,0 +1,30 @@
+{
+  "name": "VOXAORA",
+  "short_name": "VOXAORA",
+  "description": "تحدث فقط، ودع الذكاء ينفذ",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0A0A0F",
+  "theme_color": "#0A0A0F",
+  "orientation": "portrait-primary",
+  "lang": "ar",
+  "dir": "rtl",
+  "categories": ["food", "shopping"],
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    {
+      "name": "اطلب الآن",
+      "short_name": "طلب صوتي",
+      "description": "ابدأ طلباً صوتياً",
+      "url": "/",
+      "icons": [{ "src": "/icon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "طلباتي",
+      "url": "/orders",
+      "icons": [{ "src": "/icon.svg", "sizes": "any" }]
+    }
+  ]
+}

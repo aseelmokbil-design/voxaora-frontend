@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="120" fill="#0A0A0F"/>
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+  </defs>
+  <!-- V shape -->
+  <path d="M130 140 L256 372 L382 140" fill="none" stroke="url(#g)" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Sound waves -->
+  <circle cx="256" cy="256" r="200" fill="none" stroke="url(#g)" stroke-width="3" opacity="0.2"/>
+  <circle cx="256" cy="256" r="230" fill="none" stroke="url(#g)" stroke-width="2" opacity="0.1"/>
+</svg>

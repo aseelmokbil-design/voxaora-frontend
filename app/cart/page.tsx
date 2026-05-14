@@ -1,13 +1,16 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, lazy, Suspense } from "react";
 import { useCart } from "@/context/CartContext";
 import { useAuth } from "@/context/AuthContext";
 import { useToast } from "@/context/ToastContext";
 import { orderApi, merchantApi, addressApi, couponApi, Address } from "@/lib/api";
 import { useRouter } from "next/navigation";
+import dynamic from "next/dynamic";
 import BottomNav from "@/components/BottomNav";
-import { Minus, Plus, Trash2, ChevronRight, ShoppingBag, MapPin, Tag, ChevronDown } from "lucide-react";
+import { Minus, Plus, Trash2, ChevronRight, ShoppingBag, MapPin, Tag, ChevronDown, Navigation } from "lucide-react";
 import Link from "next/link";
+
+const LocationPickerModal = dynamic(() => import("@/components/LocationPickerModal"), { ssr: false });
 
 const PAYMENT_METHODS = [
   { v: "cash",    label: "💵", name: "كاش" },
@@ -22,18 +25,19 @@ export default function CartPage() {
   const { toast } = useToast();
   const router = useRouter();
 
-  const [placing, setPlacing]       = useState(false);
-  const [payMethod, setPayMethod]   = useState("cash");
-  const [deliveryFee, setDeliveryFee] = useState(0);
-  const [coupon, setCoupon]         = useState("");
+  const [placing, setPlacing]           = useState(false);
+  const [payMethod, setPayMethod]       = useState("cash");
+  const [deliveryFee, setDeliveryFee]   = useState(0);
+  const [coupon, setCoupon]             = useState("");
   const [couponApplied, setCouponApplied] = useState(false);
   const [couponDiscount, setCouponDiscount] = useState(0);
   const [validatingCoupon, setValidatingCoupon] = useState(false);
-  const [notes, setNotes]           = useState("");
-  const [addresses, setAddresses]   = useState<Address[]>([]);
+  const [notes, setNotes]               = useState("");
+  const [addresses, setAddresses]       = useState<Address[]>([]);
   const [selectedAddr, setSelectedAddr] = useState<string | null>(null);
   const [showAddrPicker, setShowAddrPicker] = useState(false);
-  const [taxAmount, setTaxAmount]   = useState(0);
+  const [showLocationModal, setShowLocationModal] = useState(false);
+  const [taxAmount, setTaxAmount]       = useState(0);
 
   useEffect(() => {
     if (!merchantId) return;
@@ -72,6 +76,11 @@ export default function CartPage() {
   const placeOrder = async () => {
     if (!user) { router.push("/auth/login"); return; }
     if (!merchantId) return;
+    if (!selectedAddr) {
+      toast("يجب تحديد عنوان التوصيل أولاً 📍", "error");
+      setShowLocationModal(true);
+      return;
+    }
     setPlacing(true);
     try {
       const order = await orderApi.create({
@@ -81,6 +90,7 @@ export default function CartPage() {
         order_type: "delivery",
         delivery_notes: notes || undefined,
         coupon_code: couponApplied ? coupon : undefined,
+        address_id: selectedAddr,
         is_voice_order: false,
       });
       clear();
@@ -111,6 +121,37 @@ export default function CartPage() {
 
   return (
     <div className="pb-36">
+      {/* Location picker modal */}
+      {showLocationModal && (
+        <LocationPickerModal
+          onConfirm={(addrId, location) => {
+            setShowLocationModal(false);
+            if (addrId === "__temp__") {
+              // No saved id — create a temporary entry in local list
+              const tempAddr: Address = {
+                id: "__temp__",
+                label: "موقعي",
+                full_address: location.full_address,
+                city: location.city,
+                district: location.district,
+                latitude: location.lat,
+                longitude: location.lng,
+                is_default: false,
+              };
+              setAddresses(prev => [tempAddr, ...prev.filter(a => a.id !== "__temp__")]);
+              setSelectedAddr("__temp__");
+            } else {
+              addressApi.list().then(addrs => {
+                setAddresses(addrs);
+                setSelectedAddr(addrId);
+              });
+            }
+            toast("تم تحديد موقعك بنجاح 📍", "success");
+          }}
+          onClose={() => setShowLocationModal(false)}
+        />
+      )}
+
       {/* Header */}
       <div className="sticky top-0 z-40 px-4 pt-4 pb-3"
            style={{ background: "rgba(10,10,15,0.95)", backdropFilter: "blur(20px)" }}>
@@ -128,7 +169,6 @@ export default function CartPage() {
       <div className="px-4 space-y-2 mb-4">
         {items.map(item => (
           <div key={item.product.id} className="glass-card p-3.5 flex items-center gap-3">
-            {/* Product image */}
             <div className="w-14 h-14 rounded-xl overflow-hidden flex-shrink-0 bg-vox-card">
               {item.product.image_url ? (
                 // eslint-disable-next-line @next/next/no-img-element
@@ -138,8 +178,6 @@ export default function CartPage() {
                 <div className="w-full h-full flex items-center justify-center text-2xl bg-gradient-to-br from-vox-purple/10 to-vox-blue/10">🍽️</div>
               )}
             </div>
-
-            {/* Info */}
             <div className="flex-1 min-w-0 text-right">
               <p className="text-white font-semibold text-sm line-clamp-1">{item.product.name_ar || item.product.name}</p>
               <p className="text-vox-purple text-sm font-bold mt-0.5">
@@ -147,8 +185,6 @@ export default function CartPage() {
               </p>
               <p className="text-vox-muted text-xs">{item.product.price} ر.س × {item.quantity}</p>
             </div>
-
-            {/* Qty controls */}
             <div className="flex items-center gap-2 flex-shrink-0">
               <button
                 onClick={() => item.quantity === 1 ? removeItem(item.product.id) : updateQty(item.product.id, item.quantity - 1)}
@@ -168,53 +204,61 @@ export default function CartPage() {
         ))}
       </div>
 
-      {/* Delivery address */}
-      {addresses.length > 0 && (
-        <div className="px-4 mb-4">
+      {/* ── Delivery address ── */}
+      <div className="px-4 mb-4">
+        {/* Location picker button — always visible */}
+        <button
+          onClick={() => setShowLocationModal(true)}
+          className="w-full flex items-center justify-center gap-2 py-3.5 rounded-2xl font-bold text-sm mb-2 transition-all active:scale-95"
+          style={{ background: "rgba(109,40,255,0.15)", color: "#A855F7", border: "2px solid rgba(109,40,255,0.35)" }}
+        >
+          <Navigation size={15} />
+          {selectedAddr ? "تغيير موقع التوصيل" : "📍 حدد موقع التوصيل"}
+        </button>
+
+        {/* Show selected address */}
+        {selectedAddress && (
+          <div className="glass-card p-3.5 rounded-2xl flex items-start gap-2">
+            <MapPin size={15} className="text-vox-purple mt-0.5 flex-shrink-0" />
+            <div className="text-right flex-1">
+              <p className="text-white text-sm font-semibold">{selectedAddress.label}</p>
+              <p className="text-vox-muted text-xs mt-0.5 leading-relaxed">{selectedAddress.full_address}</p>
+            </div>
+          </div>
+        )}
+
+        {/* Saved addresses dropdown */}
+        {addresses.length > 1 && (
           <button
             onClick={() => setShowAddrPicker(v => !v)}
-            className="w-full glass-card p-4 flex items-center justify-between rounded-2xl"
+            className="w-full mt-2 px-3 py-2 rounded-xl flex items-center justify-end gap-1.5 text-vox-muted text-xs"
           >
-            <ChevronDown size={16} className={`text-vox-muted transition-transform ${showAddrPicker ? "rotate-180" : ""}`} />
-            <div className="flex items-center gap-2 text-right">
-              <div>
-                <p className="text-white text-sm font-semibold">
-                  {selectedAddress ? selectedAddress.label : "اختر عنوان التوصيل"}
-                </p>
-                {selectedAddress && (
-                  <p className="text-vox-muted text-xs mt-0.5 line-clamp-1">{selectedAddress.full_address}</p>
-                )}
-              </div>
-              <MapPin size={16} className="text-vox-purple flex-shrink-0" />
-            </div>
+            <ChevronDown size={13} className={`transition-transform ${showAddrPicker ? "rotate-180" : ""}`} />
+            عناوين محفوظة
           </button>
-          {showAddrPicker && (
-            <div className="mt-2 space-y-2">
-              {addresses.map(a => (
-                <button
-                  key={a.id}
-                  onClick={() => { setSelectedAddr(a.id); setShowAddrPicker(false); }}
-                  className={`w-full p-3 rounded-xl border text-right transition-all ${
-                    selectedAddr === a.id ? "border-vox-purple bg-vox-purple/10" : "border-vox-border bg-vox-card/50"
-                  }`}
-                >
-                  <p className="text-white text-sm font-semibold">{a.label}</p>
-                  <p className="text-vox-muted text-xs mt-0.5">{a.full_address}</p>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+        )}
+        {showAddrPicker && (
+          <div className="mt-1 space-y-1.5">
+            {addresses.map(a => (
+              <button key={a.id} onClick={() => { setSelectedAddr(a.id); setShowAddrPicker(false); }}
+                className={`w-full p-3 rounded-xl border text-right transition-all ${
+                  selectedAddr === a.id ? "border-vox-purple bg-vox-purple/10" : "border-vox-border bg-vox-card/50"
+                }`}>
+                <p className="text-white text-sm font-semibold">{a.label}</p>
+                <p className="text-vox-muted text-xs mt-0.5">{a.full_address}</p>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
 
       {/* Delivery notes */}
       <div className="px-4 mb-4">
         <textarea
           value={notes}
           onChange={e => setNotes(e.target.value)}
-          placeholder="ملاحظات للتوصيل (اختياري) — مثال: اتصل عند الوصول..."
-          dir="rtl"
-          rows={2}
+          placeholder="ملاحظات للتوصيل (اختياري)..."
+          dir="rtl" rows={2}
           className="w-full bg-vox-card border border-vox-border rounded-2xl px-4 py-3 text-white placeholder-vox-muted text-sm focus:outline-none focus:border-vox-purple transition-colors resize-none"
         />
       </div>
@@ -222,28 +266,18 @@ export default function CartPage() {
       {/* Coupon */}
       <div className="px-4 mb-4">
         <div className="flex gap-2">
-          <button
-            onClick={applyCoupon}
-            disabled={couponApplied || !coupon.trim() || validatingCoupon}
-            className="bg-vox-purple disabled:opacity-40 rounded-xl px-4 py-3 text-white text-sm font-bold flex-shrink-0 transition-opacity"
-          >
+          <button onClick={applyCoupon} disabled={couponApplied || !coupon.trim() || validatingCoupon}
+            className="bg-vox-purple disabled:opacity-40 rounded-xl px-4 py-3 text-white text-sm font-bold flex-shrink-0 transition-opacity">
             {validatingCoupon ? "..." : "تطبيق"}
           </button>
           <div className="flex-1 relative">
             <Tag size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-vox-muted pointer-events-none" />
-            <input
-              value={coupon}
-              onChange={e => setCoupon(e.target.value.toUpperCase())}
-              placeholder="كود الخصم"
-              disabled={couponApplied}
-              dir="ltr"
-              className="w-full bg-vox-card border border-vox-border rounded-xl pr-9 pl-4 py-3 text-white placeholder-vox-muted text-sm focus:outline-none focus:border-vox-purple transition-colors disabled:opacity-60 tracking-widest"
-            />
+            <input value={coupon} onChange={e => setCoupon(e.target.value.toUpperCase())}
+              placeholder="كود الخصم" disabled={couponApplied} dir="ltr"
+              className="w-full bg-vox-card border border-vox-border rounded-xl pr-9 pl-4 py-3 text-white placeholder-vox-muted text-sm focus:outline-none focus:border-vox-purple transition-colors disabled:opacity-60 tracking-widest" />
           </div>
         </div>
-        {couponApplied && (
-          <p className="text-green-400 text-xs text-right mt-1.5 font-semibold">✓ تم تطبيق خصم 10%</p>
-        )}
+        {couponApplied && <p className="text-green-400 text-xs text-right mt-1.5 font-semibold">✓ تم تطبيق الخصم</p>}
       </div>
 
       {/* Payment method */}
@@ -253,9 +287,7 @@ export default function CartPage() {
           {PAYMENT_METHODS.map(pm => (
             <button key={pm.v} onClick={() => setPayMethod(pm.v)}
               className={`flex flex-col items-center gap-1 py-3 rounded-xl border text-xs font-semibold transition-all ${
-                payMethod === pm.v
-                  ? "bg-vox-purple border-vox-purple text-white"
-                  : "border-vox-border text-vox-muted hover:border-vox-purple/40"
+                payMethod === pm.v ? "bg-vox-purple border-vox-purple text-white" : "border-vox-border text-vox-muted"
               }`}>
               <span className="text-lg">{pm.label}</span>
               <span className="text-[10px]">{pm.name}</span>
@@ -281,7 +313,7 @@ export default function CartPage() {
           </div>
           {couponApplied && couponDiscount > 0 && (
             <div className="flex justify-between text-sm">
-              <span className="text-green-400">-{couponDiscount.toFixed(2)} ر.ي</span>
+              <span className="text-green-400">-{couponDiscount.toFixed(2)} ر.س</span>
               <span className="text-vox-muted">كوبون خصم</span>
             </div>
           )}
@@ -294,9 +326,7 @@ export default function CartPage() {
 
       {/* CTA */}
       <div className="fixed bottom-20 left-4 right-4 max-w-[430px] mx-auto z-50">
-        <button
-          onClick={placeOrder}
-          disabled={placing}
+        <button onClick={placeOrder} disabled={placing}
           className="w-full bg-gradient-to-r from-vox-purple to-vox-blue rounded-2xl py-4 font-bold text-white text-base glow-purple disabled:opacity-50 transition-opacity"
         >
           {placing ? "جارٍ تأكيد الطلب..." : `تأكيد الطلب · ${grandTotal.toFixed(2)} ر.س`}

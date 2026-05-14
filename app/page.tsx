@@ -14,6 +14,8 @@ const CATEGORIES = [
   { id: "restaurant",  label: "المطاعم",      emoji: "🍔", bg: "rgba(239,68,68,0.18)",   color: "#EF4444" },
   { id: "grocery",     label: "سوبر ماركت",   emoji: "🛒", bg: "rgba(34,197,94,0.18)",   color: "#22C55E" },
   { id: "fastfood",    label: "وجبات سريعة",  emoji: "🍟", bg: "rgba(245,158,11,0.18)",  color: "#F59E0B" },
+  { id: "coffee",      label: "مشروبات",      emoji: "☕", bg: "rgba(120,80,40,0.22)",   color: "#D97706" },
+  { id: "dessert",     label: "حلويات",       emoji: "🍰", bg: "rgba(236,72,153,0.18)",  color: "#EC4899" },
   { id: "pharmacy",    label: "صيدلية",        emoji: "💊", bg: "rgba(59,130,246,0.18)",  color: "#3B82F6" },
   { id: "bakery",      label: "مخبز",          emoji: "🥐", bg: "rgba(249,115,22,0.18)", color: "#F97316" },
   { id: "all",         label: "كل الفئات",    emoji: "▤",  bg: "rgba(109,40,255,0.18)", color: "#A855F7" },

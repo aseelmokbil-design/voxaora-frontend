@@ -104,17 +104,20 @@ export interface MerchantBrief { id: string; name: string; name_ar: string; logo
 
 export interface TrackingSnapshot {
   status: string;
-  merchant_lat: number; merchant_lng: number; merchant_name: string;
-  customer_lat: number; customer_lng: number;
+  order_number: string;
+  merchant_lat: number; merchant_lng: number; merchant_name: string; merchant_address?: string;
+  customer_lat: number; customer_lng: number; customer_address?: string;
   driver_lat: number; driver_lng: number;
-  eta_minutes: number; order_number: string;
+  has_driver: boolean;
+  eta_minutes: number;
+  route_coords?: [number, number][]; // [[lng, lat], ...] from OSRM
 }
 
 export const orderApi = {
   create: (data: {
     merchant_id: string; items: OrderItem[]; payment_method?: string;
     order_type?: string; delivery_notes?: string; coupon_code?: string;
-    is_voice_order?: boolean; voice_session_id?: string;
+    address_id?: string; is_voice_order?: boolean; voice_session_id?: string;
   }) => req<Order>("/api/v1/orders", { method: "POST", body: JSON.stringify(data) }),
 
   list: (status?: string) => {
@@ -146,9 +149,13 @@ export const addressApi = {
     const profile = await req<{ addresses?: Address[] }>("/api/v1/users/me");
     return profile.addresses ?? [];
   },
+  add: (data: { label?: string; full_address?: string; city?: string; district?: string; latitude: number; longitude: number; is_default?: boolean }) =>
+    req<Address>("/api/v1/users/me/addresses", { method: "POST", body: JSON.stringify(data) }),
   create: (data: Omit<Address, "id" | "is_default"> & { is_default?: boolean }) =>
     req<Address>("/api/v1/users/me/addresses", { method: "POST", body: JSON.stringify(data) }),
   delete: (id: string) => req<{ message: string }>(`/api/v1/users/me/addresses/${id}`, { method: "DELETE" }),
+  reverseGeocode: (lat: number, lng: number) =>
+    req<{ full_address: string; city: string; district: string }>(`/api/v1/users/geocode/reverse?lat=${lat}&lng=${lng}`),
 };
 
 // ── Loyalty & Streaks ──────────────────────────────────────────────────
@@ -238,7 +245,9 @@ export interface VoiceResponse {
   session_id: string; transcript: string;
   intent: { category?: string; items?: unknown[]; language?: string; action?: string; selected_index?: number; [key: string]: unknown; };
   recommendations: VoiceRecommendation[];
-  tts_response: string; processing_ms: number;
+  tts_response: string;
+  audio_base64?: string | null;   // base64 MP3 from Edge TTS
+  processing_ms: number;
 }
 
 export interface VoiceContext {
@@ -249,6 +258,68 @@ export interface VoiceContext {
   }>;
   previous_session_id: string;
 }
+
+// ── Agent (Conversational AI) ─────────────────────────────────────────
+export interface AgentOrderDraftItem {
+  product_id: string; name_ar: string; qty: number; unit_price: number; subtotal: number;
+}
+export interface AgentOrderDraft {
+  merchant_id: string; merchant_name_ar: string; eta_minutes: number;
+  items: AgentOrderDraftItem[];
+  subtotal: number; delivery_fee: number; service_fee: number; total: number;
+}
+export interface AgentTurnResponse {
+  session_id: string;
+  state: string;   // listening | recommending | clarifying | confirming | dispatching | tracking | delivered | cancelled
+  tts: string;
+  audio_base64?: string | null;
+  order_draft?: AgentOrderDraft | null;
+  order_id?: string | null;
+  order_number?: string | null;
+  clarification_options: string[];
+  missing_items: string[];
+  alternatives: Record<string, { product_name_ar: string; price: number; merchant_name_ar: string }[]>;
+  coverage_pct: number;
+}
+
+export const agentApi = {
+  startSession: (lat: number, lng: number): Promise<{ session_id: string; tts: string; audio_base64?: string; state: string }> => {
+    const params = new URLSearchParams({ latitude: String(lat), longitude: String(lng) });
+    return req(`/api/v1/agent/session?${params}`, { method: "POST" });
+  },
+
+  audioTurn: async (sessionId: string, audio: Blob, lat: number, lng: number): Promise<AgentTurnResponse> => {
+    const t = token();
+    const form = new FormData();
+    const ext = audio.type.includes("ogg") ? "ogg" : audio.type.includes("mp4") ? "mp4" : "webm";
+    form.append("audio", audio, `audio.${ext}`);
+    form.append("latitude", String(lat));
+    form.append("longitude", String(lng));
+    const res = await fetch(`${API}/api/v1/agent/session/${sessionId}/turn`, {
+      method: "POST",
+      headers: t ? { Authorization: `Bearer ${t}` } : {},
+      body: form,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      const e = new Error(err.detail ?? "Agent turn failed") as Error & { status: number };
+      e.status = res.status;
+      throw e;
+    }
+    return res.json();
+  },
+
+  textTurn: (sessionId: string, transcript: string, lat: number, lng: number): Promise<AgentTurnResponse> =>
+    req<AgentTurnResponse>(`/api/v1/agent/session/${sessionId}/text`, {
+      method: "POST",
+      body: JSON.stringify({ transcript, latitude: lat, longitude: lng }),
+    }),
+
+  status: (sessionId: string) =>
+    req<{ session_id: string; state: string; order_id?: string; order_number?: string; order_draft?: AgentOrderDraft; total_turns: number; coverage_pct: number; missing_items: string[] }>(
+      `/api/v1/agent/session/${sessionId}`
+    ),
+};
 
 // ── Admin ─────────────────────────────────────────────────────────────
 export interface AdminMerchant {
@@ -542,8 +613,12 @@ export const statsApi = {
 
 export const voiceApi = {
   transcribe: async (audioBlob: Blob, lat: number, lng: number, context?: VoiceContext): Promise<VoiceResponse> => {
+    const ext = audioBlob.type.includes("mp4") ? "mp4"
+              : audioBlob.type.includes("ogg")  ? "ogg"
+              : audioBlob.type.includes("wav")  ? "wav"
+              : "webm";
     const form = new FormData();
-    form.append("audio", audioBlob, "voice.webm");
+    form.append("audio", audioBlob, `voice.${ext}`);
     form.append("latitude", String(lat));
     form.append("longitude", String(lng));
     if (context) form.append("context_json", JSON.stringify(context));
@@ -573,6 +648,55 @@ export const voiceApi = {
     }>("/api/v1/voice/confirm", {
       method: "POST",
       body: JSON.stringify({ session_id, selected_index, payment_method }),
+    }),
+};
+
+// ── Conversational Shopping Agent ────────────────────────────────────
+export interface AgentCartItem {
+  product_id: string;
+  product_name: string;
+  quantity: number;
+  unit_price: number;
+  subtotal: number;
+  selected_options: Record<string, string>;
+  image_url?: string;
+}
+
+export interface AgentQuestion {
+  item_index: number;
+  field: string;
+  question: string;
+  options: string[];
+}
+
+export interface AgentUnavailableItem {
+  name: string;
+  alternatives: { id: string; name_ar: string; price: number }[];
+}
+
+export interface AgentResponse {
+  session_id: string;
+  status: "needs_clarification" | "needs_confirmation" | "completed" | "error";
+  response_text: string;
+  questions: AgentQuestion[];
+  cart_items: AgentCartItem[];
+  unavailable_items: AgentUnavailableItem[];
+  alternatives: { requested_name: string; alternatives: { id: string; name_ar: string; price: number }[] }[];
+  summary: string;
+  total_amount: number;
+}
+
+export const legacyAgentApi = {
+  chat: (message: string, merchantId: string, sessionId?: string | null, lat?: number, lng?: number) =>
+    req<AgentResponse>("/api/v1/ai/order-assistant", {
+      method: "POST",
+      body: JSON.stringify({
+        message,
+        merchant_id: merchantId,
+        session_id: sessionId ?? undefined,
+        latitude: lat,
+        longitude: lng,
+      }),
     }),
 };
 

@@ -3,14 +3,13 @@ import { useEffect, useRef } from "react";
 import type { Map, Marker, Polyline } from "leaflet";
 import type { TrackingSnapshot } from "@/lib/api";
 
-// Status → Arabic label
 const STATUS_LABEL: Record<string, string> = {
   pending:          "في الانتظار",
   confirmed:        "تم التأكيد",
   preparing:        "يُجهَّز طلبك",
   ready_for_pickup: "جاهز للاستلام",
   picked_up:        "تم الاستلام",
-  on_the_way:       "في الطريق إليك",
+  on_the_way:       "السائق في الطريق إليك",
   delivered:        "تم التوصيل 🎉",
   cancelled:        "ملغي",
 };
@@ -30,22 +29,20 @@ interface Props { data: TrackingSnapshot; }
 
 export default function LiveMap({ data }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const refs = useRef<{
-    map: Map;
-    driver: Marker;
-    merchant: Marker;
-    customer: Marker;
-    line: Polyline;
-  } | null>(null);
+  const mapRef = useRef<Map | null>(null);
+  const driverRef   = useRef<Marker | null>(null);
+  const routeRef    = useRef<Polyline | null>(null);
+  const initialised = useRef(false);
 
+  // ── Init map once ──────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!containerRef.current || refs.current) return;
+    if (!containerRef.current || initialised.current) return;
+    initialised.current = true;
 
-    // All leaflet APIs run client-side only (component is SSR-disabled via next/dynamic)
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const L = require("leaflet") as typeof import("leaflet");
 
-    // Fix icon paths for bundled environments
+    // Fix default icon paths
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     delete (L.Icon.Default.prototype as any)._getIconUrl;
     L.Icon.Default.mergeOptions({
@@ -55,16 +52,14 @@ export default function LiveMap({ data }: Props) {
     });
 
     const map = L.map(containerRef.current, {
-      center: [
-        (data.merchant_lat + data.customer_lat) / 2,
-        (data.merchant_lng + data.customer_lng) / 2,
-      ],
+      center: [data.merchant_lat, data.merchant_lng],
       zoom: 14,
       zoomControl: false,
       attributionControl: false,
     });
+    mapRef.current = map;
 
-    // Dark CartoDB tiles — free, no API key needed
+    // OpenStreetMap dark tiles — free, no API key
     L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
       maxZoom: 19,
     }).addTo(map);
@@ -76,53 +71,85 @@ export default function LiveMap({ data }: Props) {
         iconAnchor: [size / 2, size / 2],
       });
 
-    const merchant = L.marker([data.merchant_lat, data.merchant_lng], { icon: icon("🏪") })
+    // Merchant marker
+    L.marker([data.merchant_lat, data.merchant_lng], { icon: icon("🏪") })
       .addTo(map)
-      .bindPopup(`<b>${data.merchant_name}</b>`);
+      .bindPopup(`<b>${data.merchant_name}</b>${data.merchant_address ? `<br/>${data.merchant_address}` : ""}`);
 
-    const customer = L.marker([data.customer_lat, data.customer_lng], { icon: icon("📍", 32) })
+    // Customer marker
+    L.marker([data.customer_lat, data.customer_lng], { icon: icon("📍", 32) })
       .addTo(map)
-      .bindPopup("موقعك");
+      .bindPopup(data.customer_address || "موقعك");
 
-    const driver = L.marker([data.driver_lat, data.driver_lng], { icon: icon("🛵", 40) })
-      .addTo(map);
+    // Driver marker — only show if assigned
+    if (data.has_driver) {
+      const m = L.marker([data.driver_lat, data.driver_lng], { icon: icon("🛵", 40) }).addTo(map);
+      driverRef.current = m;
+    }
 
-    const line = L.polyline(
-      [[data.merchant_lat, data.merchant_lng], [data.customer_lat, data.customer_lng]],
-      { color: "#8B5CF6", weight: 2, dashArray: "6,8", opacity: 0.65 },
-    ).addTo(map);
+    // Route polyline — from OSRM real geometry if available, else straight dashed line
+    if (data.route_coords && data.route_coords.length > 1) {
+      // OSRM returns [lng, lat] pairs — Leaflet expects [lat, lng]
+      const latLngs = data.route_coords.map(([lng, lat]) => [lat, lng] as [number, number]);
+      const poly = L.polyline(latLngs, { color: "#8B5CF6", weight: 3, opacity: 0.8 }).addTo(map);
+      routeRef.current = poly;
+    } else {
+      // Fallback straight line
+      const poly = L.polyline(
+        [[data.merchant_lat, data.merchant_lng], [data.customer_lat, data.customer_lng]],
+        { color: "#8B5CF6", weight: 2, dashArray: "6,8", opacity: 0.5 },
+      ).addTo(map);
+      routeRef.current = poly;
+    }
 
-    // Fit all three points
-    const bounds = L.latLngBounds([
+    // Fit bounds to all visible markers
+    const points: [number, number][] = [
       [data.merchant_lat, data.merchant_lng],
       [data.customer_lat, data.customer_lng],
-      [data.driver_lat, data.driver_lng],
-    ]);
-    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 });
-
-    refs.current = { map, driver, merchant, customer, line };
+    ];
+    if (data.has_driver) points.push([data.driver_lat, data.driver_lng]);
+    map.fitBounds(L.latLngBounds(points), { padding: [40, 40], maxZoom: 15 });
 
     return () => {
       map.remove();
-      refs.current = null;
+      mapRef.current = null;
+      driverRef.current = null;
+      routeRef.current = null;
+      initialised.current = false;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Update driver position on every data change
+  // ── Update driver position on every real GPS push ─────────────────────────
   useEffect(() => {
-    if (!refs.current) return;
-    refs.current.driver.setLatLng([data.driver_lat, data.driver_lng]);
-
+    if (!mapRef.current) return;
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const L = require("leaflet") as typeof import("leaflet");
-    const bounds = L.latLngBounds([
+
+    if (data.has_driver) {
+      if (driverRef.current) {
+        driverRef.current.setLatLng([data.driver_lat, data.driver_lng]);
+      } else {
+        // Driver was just assigned — add marker
+        const icon = (emoji: string, size = 36) =>
+          L.divIcon({
+            html: `<div style="font-size:${size}px;line-height:1;filter:drop-shadow(0 2px 8px rgba(0,0,0,.7))">${emoji}</div>`,
+            className: "",
+            iconAnchor: [size / 2, size / 2],
+          });
+        driverRef.current = L.marker([data.driver_lat, data.driver_lng], { icon: icon("🛵", 40) })
+          .addTo(mapRef.current);
+      }
+    }
+
+    // Re-fit bounds
+    const points: [number, number][] = [
       [data.merchant_lat, data.merchant_lng],
       [data.customer_lat, data.customer_lng],
-      [data.driver_lat,   data.driver_lng],
-    ]);
-    refs.current.map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15, animate: true });
-  }, [data.driver_lat, data.driver_lng, data.merchant_lat, data.merchant_lng, data.customer_lat, data.customer_lng]);
+    ];
+    if (data.has_driver) points.push([data.driver_lat, data.driver_lng]);
+    mapRef.current.fitBounds(L.latLngBounds(points), { padding: [40, 40], maxZoom: 15, animate: true });
+  }, [data.driver_lat, data.driver_lng, data.has_driver, data.merchant_lat, data.merchant_lng, data.customer_lat, data.customer_lng]);
 
   const color = STATUS_COLOR[data.status] ?? "#8B5CF6";
   const label = STATUS_LABEL[data.status] ?? data.status;
@@ -133,22 +160,25 @@ export default function LiveMap({ data }: Props) {
       <div className="flex items-center justify-between px-4 py-3"
            style={{ borderBottom: `1px solid ${color}33` }}>
         <div className="flex items-center gap-2">
-          {data.status !== "delivered" && data.status !== "cancelled" && (
+          {data.eta_minutes > 0 && data.status !== "delivered" && (
             <span className="text-xs text-vox-muted">{data.eta_minutes} دقيقة</span>
+          )}
+          {!data.has_driver && data.status === "ready_for_pickup" && (
+            <span className="text-[10px] text-amber-400 animate-pulse">يُبحث عن سائق...</span>
           )}
           <div className="w-2 h-2 rounded-full animate-pulse" style={{ background: color }} />
         </div>
         <span className="text-sm font-bold" style={{ color }}>{label}</span>
       </div>
 
-      {/* Map container */}
-      <div ref={containerRef} style={{ height: 220, width: "100%" }} />
+      {/* Leaflet map */}
+      <div ref={containerRef} style={{ height: 240, width: "100%" }} />
 
       {/* Legend */}
       <div className="flex justify-center gap-5 px-4 py-2 text-[11px] text-vox-muted border-t"
            style={{ borderColor: "#1E1E2E" }}>
         <span>🏪 {data.merchant_name}</span>
-        <span>🛵 السائق</span>
+        {data.has_driver ? <span>🛵 السائق</span> : <span className="text-amber-400/60">🛵 لا يوجد سائق بعد</span>}
         <span>📍 أنت</span>
       </div>
     </div>

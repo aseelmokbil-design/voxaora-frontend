@@ -1,305 +1,253 @@
 "use client";
 import { useState, useRef, useCallback, useEffect } from "react";
-import { Mic, Square, X, CheckCircle, RotateCcw, ShoppingCart, Zap } from "lucide-react";
-import { voiceApi, VoiceRecommendation, VoiceResponse, VoiceContext, intelligenceApi } from "@/lib/api";
+import {
+  Mic, Square, X, CheckCircle, RotateCcw, ShoppingCart,
+  Loader2, MessageSquare, Clock, Star, Truck,
+} from "lucide-react";
+import { agentApi, AgentTurnResponse, AgentOrderDraft } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
-import { useCart } from "@/context/CartContext";
 import { useRouter } from "next/navigation";
 import clsx from "clsx";
-import ConciergeModal from "./ConciergeModal";
 
+// ─── Agent states from backend ───────────────────────────────────────────────
+type AgentState =
+  | "listening" | "recommending" | "clarifying" | "confirming"
+  | "dispatching" | "tracking" | "delivered" | "cancelled";
+
+// ─── Local UI states ─────────────────────────────────────────────────────────
 type Phase =
-  | "idle" | "greeting" | "listening" | "followup_listening" | "processing"
-  | "results" | "unavailable" | "confirming" | "done" | "error";
-
-const IDENTITY_MESSAGES = [
-  { line1: "اخترت لك أفضل قيمة في المنطقة", line2: "قرار ذكي في أقل من دقيقة." },
-  { line1: "وفّرت عليك البحث والمقارنة",     line2: "وقتك أغلى من أن تضيعه." },
-  { line1: "فوكسورا اختار الأفضل لك",          line2: "أنت فقط تحدثت، نحن أنجزنا." },
-  { line1: "طلبت بذكاء، ستصل بسرعة",          line2: "هذا ما يعنيه التطبيق الذكي." },
-  { line1: "قارنّا لك، اخترنا الأسرع والأجود", line2: "لا بحث، لا حيرة، فقط النتيجة." },
-];
+  | "idle"           // no session yet
+  | "starting"       // creating session
+  | "recording"      // mic open
+  | "processing"     // waiting for backend
+  | "agent"          // showing agent response, waiting for next turn
+  | "confirming"     // order summary visible
+  | "clarifying"     // clarification buttons visible
+  | "done"           // order dispatched
+  | "tracking"       // tracking order
+  | "error";
 
 interface Props { lat?: number; lng?: number; }
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// ─── Audio engine ─────────────────────────────────────────────────────────────
+let _audioEl: HTMLAudioElement | null = null;
+let _onAudioDone: (() => void) | null = null;
 
-// ── Haptic feedback (Android / supported browsers) ────────────────────────────
-const haptic = (pattern: number | number[]) => {
-  if (typeof navigator !== "undefined" && "vibrate" in navigator) {
-    try { navigator.vibrate(pattern); } catch { /* ignore */ }
-  }
-};
-
-// ── TTS ───────────────────────────────────────────────────────────────────────
-function speak(text: string, lang = "ar-SA"): Promise<void> {
-  return new Promise(resolve => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) { resolve(); return; }
-    window.speechSynthesis.cancel();
-    const utt = new SpeechSynthesisUtterance(text);
-    utt.lang = lang; utt.rate = 0.92; utt.pitch = 1.05;
-    const voices = window.speechSynthesis.getVoices();
-    const arVoice = voices.find(v => v.lang.startsWith("ar") && (v.name.includes("Google") || v.name.includes("Arabic")))
-                 ?? voices.find(v => v.lang.startsWith("ar"));
-    if (arVoice && lang.startsWith("ar")) utt.voice = arVoice;
-    utt.onend = () => resolve(); utt.onerror = () => resolve();
-    window.speechSynthesis.speak(utt);
-  });
+function unlockAudio(): void {
+  if (typeof window === "undefined" || _audioEl) return;
+  try {
+    _audioEl = new Audio();
+    _audioEl.src =
+      "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+    _audioEl.play().catch(() => {});
+  } catch { /* */ }
 }
 
+function stopAudio(): void {
+  _onAudioDone = null;
+  try { _audioEl?.pause(); if (_audioEl) _audioEl.currentTime = 0; } catch { /* */ }
+  try { window.speechSynthesis?.cancel(); } catch { /* */ }
+}
+
+function playBase64(b64: string, onDone?: () => void): void {
+  if (!b64) { onDone?.(); return; }
+  _onAudioDone = onDone ?? null;
+  try {
+    const el = _audioEl ?? (() => { _audioEl = new Audio(); return _audioEl; })();
+    el.pause();
+    el.onended = () => { const cb = _onAudioDone; _onAudioDone = null; cb?.(); };
+    el.onerror = () => { const cb = _onAudioDone; _onAudioDone = null; cb?.(); };
+    el.src = `data:audio/mp3;base64,${b64}`;
+    el.play().catch(() => {
+      try {
+        const a2 = new Audio(`data:audio/mp3;base64,${b64}`);
+        a2.onended = () => { const cb = _onAudioDone; _onAudioDone = null; cb?.(); };
+        a2.play().catch(() => {});
+      } catch { /* */ }
+    });
+  } catch { /* */ }
+}
+
+function speakBrowser(text: string): void {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  try {
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "ar-SA"; u.rate = 0.88;
+    window.speechSynthesis.speak(u);
+  } catch { /* */ }
+}
+
+function speak(text: string, b64?: string | null, onDone?: () => void): void {
+  if (b64) { playBase64(b64, onDone); }
+  else { speakBrowser(text); onDone?.(); }
+}
+
+const haptic = (p: number | number[]) => {
+  try { navigator.vibrate?.(p); } catch { /* */ }
+};
+
+// ─── State labels ────────────────────────────────────────────────────────────
+const STATE_LABELS: Record<AgentState, string> = {
+  listening:    "🎙️ أنا أسمعك...",
+  recommending: "🔍 وجدت لك أفضل خيار",
+  clarifying:   "❓ سؤال سريع",
+  confirming:   "📋 تأكيد الطلب",
+  dispatching:  "✅ جارٍ إرسال الطلب",
+  tracking:     "🛵 طلبك في الطريق",
+  delivered:    "🎉 وصل طلبك!",
+  cancelled:    "❌ تم الإلغاء",
+};
+
+// ─── Component ────────────────────────────────────────────────────────────────
 export default function VoiceOrb({ lat = 15.3694, lng = 44.1910 }: Props) {
   const { user } = useAuth();
-  const { addItem } = useCart();
   const router   = useRouter();
 
-  const [phase,            setPhase]            = useState<Phase>("idle");
-  const [transcript,       setTranscript]        = useState("");
-  const [results,          setResults]           = useState<VoiceRecommendation[]>([]);
-  const [sessionId,        setSessionId]         = useState("");
-  const [ttsText,          setTtsText]           = useState("");
-  const [error,            setError]             = useState("");
-  const [textInput,        setTextInput]         = useState("");
-  const [audioLevel,       setAudioLevel]        = useState(0);
-  const [recordingSeconds, setRecordingSeconds]  = useState(0);
-  const [showConcierge,    setShowConcierge]     = useState(false);
-  const [lastTranscript,   setLastTranscript]    = useState("");
-  const [identityMsg,      setIdentityMsg]       = useState<typeof IDENTITY_MESSAGES[0] | null>(null);
-  const [cartAdded,        setCartAdded]         = useState<number | null>(null);
+  const [phase,       setPhase]       = useState<Phase>("idle");
+  const [sessionId,   setSessionId]   = useState("");
+  const [agentState,  setAgentState]  = useState<AgentState>("listening");
+  const [ttsText,     setTtsText]     = useState("اضغط وتحدث، أنا أسمعك.");
+  const [orderDraft,  setOrderDraft]  = useState<AgentOrderDraft | null>(null);
+  const [orderId,     setOrderId]     = useState("");
+  const [orderNumber, setOrderNumber] = useState("");
+  const [clarOpts,    setClarOpts]    = useState<string[]>([]);
+  const [missingItems,setMissingItems]= useState<string[]>([]);
+  const [alts,        setAlts]        = useState<AgentTurnResponse["alternatives"]>({});
+  const [coverage,    setCoverage]    = useState(1.0);
+  const [audioLevel,  setAudioLevel]  = useState(0);
+  const [recSecs,     setRecSecs]     = useState(0);
+  const [textInput,   setTextInput]   = useState("");
+  const [error,       setError]       = useState("");
+  const [autoRecord,  setAutoRecord]  = useState(false);
 
-  const mediaRef    = useRef<MediaRecorder | null>(null);
-  const chunksRef   = useRef<Blob[]>([]);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const timerRef    = useRef<ReturnType<typeof setInterval> | null>(null);
-  const animRef     = useRef<number>(0);
+  const mediaRef   = useRef<MediaRecorder | null>(null);
+  const chunksRef  = useRef<Blob[]>([]);
+  const analyserRef= useRef<AnalyserNode | null>(null);
+  const timerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const animRef    = useRef<number>(0);
+  const sessionRef = useRef("");
 
-  useEffect(() => { if ("speechSynthesis" in window) window.speechSynthesis.getVoices(); }, []);
+  // keep sessionRef in sync
+  useEffect(() => { sessionRef.current = sessionId; }, [sessionId]);
 
-  const stopTimer = () => { if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; } };
+  const stopTimer = () => {
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+  };
 
-  const reset = useCallback(() => {
-    window.speechSynthesis?.cancel();
-    mediaRef.current?.stop();
-    cancelAnimationFrame(animRef.current);
-    stopTimer();
-    setPhase("idle"); setTranscript(""); setResults([]); setSessionId("");
-    setTtsText(""); setError(""); setTextInput(""); setAudioLevel(0); setRecordingSeconds(0);
-    setIdentityMsg(null); setCartAdded(null);
-  }, []);
+  // ── Apply backend turn response ─────────────────────────────────────────────
+  const applyTurn = useCallback((r: AgentTurnResponse, autoRecordAfter = false) => {
+    setSessionId(r.session_id);
+    setAgentState(r.state as AgentState);
+    setTtsText(r.tts);
+    if (r.order_draft)   setOrderDraft(r.order_draft);
+    if (r.order_id)      setOrderId(r.order_id);
+    if (r.order_number)  setOrderNumber(r.order_number);
+    setClarOpts(r.clarification_options || []);
+    setMissingItems(r.missing_items || []);
+    setAlts(r.alternatives || {});
+    setCoverage(r.coverage_pct ?? 1.0);
 
-  // ── Add voice recommendation to cart ──────────────────────────────────
-  const addRecommendationToCart = useCallback((rec: VoiceRecommendation, index: number) => {
-    if (!rec.items || rec.items.length === 0) return;
-    const merchantName = rec.name_ar || rec.name;
-    rec.items.slice(0, 3).forEach(item => {
-      addItem(
-        {
-          id: item.id,
-          name: item.name,
-          name_ar: item.name_ar,
-          price: item.price,
-          preparation_time: item.preparation_time,
-          image_url: undefined,
-        },
-        rec.id,
-        merchantName,
-      );
-    });
-    setCartAdded(index);
-    haptic([30, 50, 100]);
-    speak(`تمت إضافة منتجات ${merchantName} للسلة`, "ar-SA");
-  }, [addItem]);
+    const state = r.state as AgentState;
 
-  // ── Process API response ──────────────────────────────────────────────────
-  const processVoiceResponse = useCallback(async (data: VoiceResponse) => {
-    setTranscript(data.transcript);
-    setLastTranscript(data.transcript);
-    const lang = data.intent?.language === "en" ? "en-US" : "ar-SA";
-
-    // Reorder action: order was already placed on the backend
-    if (data.intent?.action === "reorder" && data.intent?.order_id) {
+    if (state === "dispatching" || state === "tracking") {
       setPhase("done");
-      setIdentityMsg(IDENTITY_MESSAGES[Math.floor(Math.random() * IDENTITY_MESSAGES.length)]);
-      setTtsText(data.tts_response);
-      await speak(data.tts_response, lang);
-      setTimeout(() => router.push(`/orders/${data.intent!.order_id}`), 2500);
+      haptic([30, 80, 150]);
+      speak(r.tts, r.audio_base64, () => {
+        setTimeout(() => router.push(`/orders/${r.order_id}`), 2500);
+      });
+      return;
+    }
+    if (state === "delivered") {
+      setPhase("done");
+      speak(r.tts, r.audio_base64);
+      return;
+    }
+    if (state === "cancelled") {
+      setPhase("idle");
+      speak(r.tts, r.audio_base64);
+      return;
+    }
+    if (state === "clarifying") {
+      setPhase("clarifying");
+      speak(r.tts, r.audio_base64);
+      return;
+    }
+    if (state === "confirming") {
+      setPhase("confirming");
+      speak(r.tts, r.audio_base64);
       return;
     }
 
-    if (data.recommendations.length === 0) {
-      const msg = data.tts_response || "عذراً، لم نجد نتائج. هل تريد تجربة طلب آخر؟";
-      setTtsText(msg); setPhase("unavailable");
-      await speak(msg, lang);
-    } else {
-      setResults(data.recommendations.slice(0, 3));
-      setSessionId(data.session_id);
-      setTtsText(data.tts_response);
-      setPhase("results");
-      await speak(data.tts_response, lang);
-    }
+    // recommending / listening → agent phase, auto-record after TTS
+    setPhase("agent");
+    speak(r.tts, r.audio_base64, autoRecordAfter ? () => {
+      setTimeout(() => setAutoRecord(true), 700);
+    } : undefined);
   }, [router]);
 
-  const handleApiError = useCallback(async (e: unknown) => {
-    const status = (e as { status?: number }).status;
-    if (status === 401 || status === 403) {
-      await speak("انتهت جلستك، سيتم توجيهك لتسجيل الدخول.", "ar-SA");
-      localStorage.removeItem("vox_token"); localStorage.removeItem("vox_user");
-      router.push("/auth/login"); return;
+  // ── Auto-record trigger ─────────────────────────────────────────────────────
+  useEffect(() => {
+    if (autoRecord && phase === "agent") {
+      setAutoRecord(false);
+      startRecording();
     }
-    const msg = e instanceof Error ? e.message : "حدث خطأ غير متوقع";
-    haptic([200, 100, 200]); // error pattern
-    setError(msg); setPhase("error");
-    await speak("عذراً، حدث خطأ. اضغط للمحاولة مجدداً.", "ar-SA");
-  }, [router]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRecord, phase]);
 
-  // ── Confirm order (defined early — used by startFollowup) ────────────────
-  const confirmOrder = useCallback(async (index: number) => {
-    const selected = results[index]; if (!selected) return;
-    setPhase("confirming");
-    await speak(`جارٍ تأكيد طلبك من ${selected.name_ar || selected.name}...`, "ar-SA");
-    try {
-      const res = await voiceApi.confirm(sessionId, index);
-      haptic([10, 80, 150]); // success pattern
-      setPhase("done");
-      setIdentityMsg(IDENTITY_MESSAGES[Math.floor(Math.random() * IDENTITY_MESSAGES.length)]);
-      const msg = res.tts_response || `ابشر! تم تأكيد طلبك. سيصل خلال ${res.estimated_eta} دقيقة.`;
-      setTtsText(msg);
-      await speak(msg, "ar-SA");
-      setTimeout(() => router.push(`/orders/${res.order_id}`), 2800);
-    } catch (e) { await handleApiError(e); }
-  }, [sessionId, results, router, handleApiError]);
-
-  // ── Start recording session ───────────────────────────────────────────────
+  // ── Start session ───────────────────────────────────────────────────────────
   const startSession = useCallback(async () => {
     if (!user) { router.push("/auth/login"); return; }
-    setPhase("greeting"); setError("");
-
+    unlockAudio();
+    setPhase("starting");
+    setError("");
     try {
-      const res = await fetch(`${API}/api/v1/voice/greeting?language=ar`);
-      const { greeting } = await res.json();
-      setTtsText(greeting);
-      await speak(greeting, "ar-SA");
-    } catch { await speak("أهلاً! ماذا تريد اليوم؟", "ar-SA"); }
-
-    setPhase("listening"); setRecordingSeconds(0);
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      // Audio level analyser
-      const ctx      = new AudioContext();
-      const source   = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      analyserRef.current = analyser;
-
-      const trackLevel = () => {
-        if (!analyserRef.current) return;
-        const buf = new Uint8Array(analyserRef.current.frequencyBinCount);
-        analyserRef.current.getByteFrequencyData(buf);
-        setAudioLevel(buf.reduce((s, v) => s + v, 0) / buf.length);
-        animRef.current = requestAnimationFrame(trackLevel);
-      };
-      animRef.current = requestAnimationFrame(trackLevel);
-
-      // 30-second timer
-      timerRef.current = setInterval(() => {
-        setRecordingSeconds(s => { if (s >= 29) { mediaRef.current?.stop(); return s; } return s + 1; });
-      }, 1000);
-
-      // Pick best MIME type
-      const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg", "audio/mp4", ""]
-        .find(m => !m || MediaRecorder.isTypeSupported(m)) ?? "";
-      const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-      chunksRef.current = [];
-      recorder.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-
-      recorder.onstop = async () => {
-        stopTimer();
-        cancelAnimationFrame(animRef.current);
-        stream.getTracks().forEach(t => t.stop());
-        analyserRef.current = null;
-        setAudioLevel(0);
-        setPhase("processing");
-        await speak("ممتاز! أبحث لك الآن عن أفضل الخيارات...", "ar-SA");
-
-        const blob = new Blob(chunksRef.current, { type: mime || "audio/webm" });
-
-        if (blob.size < 1000) {
-          setError("التسجيل قصير جداً. تحدث لمدة أطول ثم اضغط إيقاف.");
-          setPhase("error"); return;
-        }
-
-        try {
-          const data = await voiceApi.transcribe(blob, lat, lng);
-          await processVoiceResponse(data);
-        } catch (e: unknown) {
-          const status = (e as {status?: number}).status;
-          const msg    = e instanceof Error ? e.message : "";
-          if (status === 422 || msg.includes("فهم الكلام") || msg.includes("واضح")) {
-            // Not understood — ask to repeat, don't show error state
-            setPhase("idle");
-            await speak("ما سمعتك زين. تحدث بوضوح وقرب من الميكروفون، وحاول مجدداً.", "ar-SA");
-          } else {
-            await handleApiError(e);
-          }
-        }
-      };
-
-      mediaRef.current = recorder;
-      recorder.start(250);  // collect data every 250ms
-
-    } catch {
-      setError("لا يمكن الوصول للميكروفون. تحقق من إذن المتصفح.");
-      setPhase("error");
-      await speak("لم أتمكن من الوصول للميكروفون.", "ar-SA");
+      const res = await agentApi.startSession(lat, lng);
+      setSessionId(res.session_id);
+      setAgentState("listening");
+      setTtsText(res.tts);
+      speak(res.tts, res.audio_base64, () => {
+        setTimeout(() => setAutoRecord(true), 400);
+      });
+      setPhase("agent");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "فشل في بدء الجلسة";
+      setError(msg); setPhase("error");
     }
-  }, [user, lat, lng, router, processVoiceResponse, handleApiError]);
+  }, [user, lat, lng, router]);
 
-  const stopRecording = useCallback(() => { mediaRef.current?.stop(); }, []);
-
-  // ── Follow-up recording (multi-turn) ──────────────────────────────────────
-  const startFollowup = useCallback(async () => {
-    if (!user || results.length === 0) return;
-
-    const context: VoiceContext = {
-      previous_transcript: transcript,
-      previous_session_id: sessionId,
-      previous_results: results.map(r => ({
-        name: r.name, name_ar: r.name_ar,
-        estimated_eta_minutes: r.estimated_eta_minutes,
-        delivery_fee: r.delivery_fee,
-        distance_km: r.distance_km,
-        rating: r.rating,
-      })),
-    };
-
-    setPhase("followup_listening"); setRecordingSeconds(0);
-    await speak("تفضل، قل اختيارك.", "ar-SA");
+  // ── Recording ───────────────────────────────────────────────────────────────
+  const startRecording = useCallback(async () => {
+    if (!sessionRef.current) return;
+    unlockAudio();
+    stopAudio();
+    setPhase("recording");
+    setError("");
+    setRecSecs(0);
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const ctx    = new AudioContext();
-      const source = ctx.createMediaStreamSource(stream);
+      const src    = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
-      source.connect(analyser);
+      src.connect(analyser);
       analyserRef.current = analyser;
 
-      const trackLevel = () => {
+      const track = () => {
         if (!analyserRef.current) return;
         const buf = new Uint8Array(analyserRef.current.frequencyBinCount);
         analyserRef.current.getByteFrequencyData(buf);
         setAudioLevel(buf.reduce((s, v) => s + v, 0) / buf.length);
-        animRef.current = requestAnimationFrame(trackLevel);
+        animRef.current = requestAnimationFrame(track);
       };
-      animRef.current = requestAnimationFrame(trackLevel);
+      animRef.current = requestAnimationFrame(track);
 
       timerRef.current = setInterval(() => {
-        setRecordingSeconds(s => { if (s >= 14) { mediaRef.current?.stop(); return s; } return s + 1; });
+        setRecSecs(s => { if (s >= 29) { mediaRef.current?.stop(); return s; } return s + 1; });
       }, 1000);
 
-      const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg", "audio/mp4", ""]
+      const mime = ["audio/webm;codecs=opus","audio/webm","audio/ogg;codecs=opus","audio/mp4",""]
         .find(m => !m || MediaRecorder.isTypeSupported(m)) ?? "";
       const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
       chunksRef.current = [];
@@ -315,29 +263,27 @@ export default function VoiceOrb({ lat = 15.3694, lng = 44.1910 }: Props) {
 
         const blob = new Blob(chunksRef.current, { type: mime || "audio/webm" });
         if (blob.size < 800) {
-          setPhase("results");
-          await speak("ما سمعتك. قل اختيارك مجدداً.", "ar-SA");
+          setPhase("agent");
+          speak("ما سمعتك. تحدث بوضوح وقرب من الميكروفون.", undefined);
           return;
         }
 
         try {
-          const data = await voiceApi.transcribe(blob, lat, lng, context);
-
-          // Check if backend resolved a direct selection
-          if (data.intent?.action === "select") {
-            const idx = typeof data.intent.selected_index === "number" ? data.intent.selected_index : 0;
-            await speak(data.tts_response, "ar-SA");
-            await confirmOrder(idx);
-          } else {
-            await processVoiceResponse(data);
-          }
+          const r = await agentApi.audioTurn(sessionRef.current, blob, lat, lng);
+          applyTurn(r, r.state === "recommending");
         } catch (e) {
-          const status = (e as {status?: number}).status;
-          if (status === 422) {
-            setPhase("results");
-            await speak("ما سمعتك زين. قل اختيارك مجدداً.", "ar-SA");
+          const status = (e as { status?: number }).status;
+          const msg    = e instanceof Error ? e.message : "خطأ غير متوقع";
+          if (status === 401 || status === 403) {
+            localStorage.removeItem("vox_token");
+            router.push("/auth/login");
+            return;
+          }
+          if (status === 422 || msg.includes("فهم")) {
+            setPhase("agent");
+            speak("ما فهمت زين. قول طلبك مرة ثانية.", undefined);
           } else {
-            await handleApiError(e);
+            setError(msg); setPhase("error");
           }
         }
       };
@@ -345,165 +291,141 @@ export default function VoiceOrb({ lat = 15.3694, lng = 44.1910 }: Props) {
       mediaRef.current = recorder;
       recorder.start(250);
     } catch {
-      setPhase("results");
-      await speak("لم أتمكن من الوصول للميكروفون.", "ar-SA");
+      setError("لا يمكن الوصول للميكروفون. تحقق من الإذن.");
+      setPhase("error");
     }
-  }, [user, results, transcript, sessionId, lat, lng, processVoiceResponse, handleApiError, confirmOrder]);
+  }, [lat, lng, router, applyTurn]);
 
-  const stopFollowup = useCallback(() => { mediaRef.current?.stop(); }, []);
+  const stopRecording = useCallback(() => { mediaRef.current?.stop(); }, []);
 
-  // ── Text submit ───────────────────────────────────────────────────────────
+  // ── Text submit ─────────────────────────────────────────────────────────────
   const submitText = useCallback(async () => {
     if (!textInput.trim() || !user) return;
-    setPhase("processing");
-    await speak("ممتاز! أبحث لك الآن عن أفضل الخيارات...", "ar-SA");
-    try {
-      const data = await voiceApi.processText(textInput, lat, lng);
-      await processVoiceResponse(data);
-    } catch (e) { await handleApiError(e); }
-  }, [textInput, user, lat, lng, processVoiceResponse, handleApiError]);
+    unlockAudio();
 
-  // ── Orb visual ────────────────────────────────────────────────────────────
-  const ringScale  = 1 + (audioLevel / 255) * 1.8;
-  const orbColors: Record<Phase, string> = {
-    idle:              "bg-gradient-to-br from-vox-purple to-vox-blue",
-    greeting:          "bg-gradient-to-br from-vox-cyan to-vox-blue",
-    listening:         "bg-red-600",
-    followup_listening:"bg-orange-600",
-    processing:        "bg-vox-card border-2 border-vox-purple",
-    results:           "bg-vox-card border-2 border-vox-purple/60",
-    unavailable:       "bg-vox-card border-2 border-orange-400/60",
-    confirming:        "bg-gradient-to-br from-vox-cyan to-vox-blue",
-    done:              "bg-green-600",
-    error:             "bg-red-900 border border-red-500",
-  };
+    // If no session yet, start one
+    let sid = sessionRef.current;
+    if (!sid) {
+      try {
+        const s = await agentApi.startSession(lat, lng);
+        sid = s.session_id;
+        setSessionId(sid);
+      } catch {
+        setError("فشل في بدء الجلسة"); return;
+      }
+    }
+
+    setPhase("processing");
+    const text = textInput; setTextInput("");
+    try {
+      const r = await agentApi.textTurn(sid, text, lat, lng);
+      applyTurn(r, false);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "خطأ";
+      setError(msg); setPhase("error");
+    }
+  }, [textInput, user, lat, lng, applyTurn]);
+
+  // ── Clarification button click ──────────────────────────────────────────────
+  const sendClarification = useCallback(async (answer: string) => {
+    if (!sessionRef.current) return;
+    setPhase("processing");
+    try {
+      const r = await agentApi.textTurn(sessionRef.current, answer, lat, lng);
+      applyTurn(r, false);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "خطأ";
+      setError(msg); setPhase("error");
+    }
+  }, [lat, lng, applyTurn]);
+
+  // ── Confirm / Cancel ────────────────────────────────────────────────────────
+  const confirmOrder = useCallback(() => sendClarification("نعم"), [sendClarification]);
+  const cancelOrder  = useCallback(() => sendClarification("لا"),  [sendClarification]);
+
+  // ── Reset ───────────────────────────────────────────────────────────────────
+  const reset = useCallback(() => {
+    stopAudio();
+    mediaRef.current?.stop();
+    cancelAnimationFrame(animRef.current);
+    stopTimer();
+    setPhase("idle"); setSessionId(""); setAgentState("listening");
+    setTtsText("اضغط وتحدث، أنا أسمعك."); setError(""); setTextInput("");
+    setOrderDraft(null); setOrderId(""); setOrderNumber("");
+    setClarOpts([]); setMissingItems([]); setAlts({});
+    setAudioLevel(0); setRecSecs(0); setCoverage(1.0);
+  }, []);
+
+  // ─── Visual ───────────────────────────────────────────────────────────────
+  const ringScale = 1 + (audioLevel / 255) * 1.8;
 
   return (
-    <div className="flex flex-col items-center w-full">
+    <div className="flex flex-col items-center w-full gap-3">
 
-      {/* ── Orb ───────────────────────────────────────────────────────────── */}
-      <div className="relative flex items-center justify-center mb-5">
+      {/* ── Orb ─────────────────────────────────────────────────────────── */}
+      <div className="relative flex items-center justify-center mb-2">
+        {/* Idle pulse rings */}
         {phase === "idle" && (
           <><div className="absolute w-36 h-36 rounded-full bg-vox-purple/10 orb-ring" />
             <div className="absolute w-36 h-36 rounded-full bg-vox-purple/10 orb-ring orb-ring-2" /></>
         )}
-        {(phase === "listening" || phase === "followup_listening") && (
-          <><div className={`absolute w-36 h-36 rounded-full ${phase === "followup_listening" ? "bg-orange-500/20" : "bg-red-500/20"} transition-transform duration-75`}
-                 style={{ transform: `scale(${ringScale})` }} />
-            <div className={`absolute w-36 h-36 rounded-full ${phase === "followup_listening" ? "bg-orange-500/10" : "bg-red-500/10"} orb-ring`} /></>
-        )}
-        {["greeting","confirming"].includes(phase) && (
-          <><div className="absolute w-36 h-36 rounded-full bg-vox-cyan/20 orb-ring" style={{ animationDuration:"1.5s" }} />
-            <div className="absolute w-36 h-36 rounded-full bg-vox-cyan/10 orb-ring orb-ring-2" style={{ animationDuration:"1.5s" }} /></>
+        {/* Recording level ring */}
+        {phase === "recording" && (
+          <div className="absolute w-36 h-36 rounded-full bg-red-500/20 transition-transform duration-75"
+               style={{ transform: `scale(${ringScale})` }} />
         )}
 
         <button
           onClick={
-            phase === "idle"               ? startSession  :
-            phase === "listening"          ? stopRecording :
-            phase === "followup_listening" ? stopFollowup  :
-            phase === "error"              ? reset : undefined
+            phase === "idle"      ? startSession :
+            phase === "agent"     ? startRecording :
+            phase === "recording" ? stopRecording :
+            phase === "error"     ? reset : undefined
           }
-          disabled={["greeting","processing","confirming","done","results","unavailable"].includes(phase)}
+          disabled={["starting","processing","done","clarifying","confirming","tracking"].includes(phase)}
           className={clsx(
-            "w-28 h-28 rounded-full flex items-center justify-center transition-all duration-300 text-white relative z-10 select-none",
-            orbColors[phase],
-            phase === "idle"      && "glow-purple hover:scale-105 active:scale-95 cursor-pointer",
-            phase === "listening" && "recording-glow cursor-pointer",
-            phase === "done"      && "glow-cyan",
-            phase === "error"     && "cursor-pointer hover:opacity-80",
+            "w-28 h-28 rounded-full flex items-center justify-center transition-all duration-300",
+            "text-white relative z-10 select-none",
+            phase === "idle"       && "bg-gradient-to-br from-vox-purple to-vox-blue glow-purple hover:scale-105 active:scale-95 cursor-pointer",
+            phase === "starting"   && "bg-vox-card border-2 border-vox-purple/60",
+            phase === "recording"  && "bg-red-600 recording-glow cursor-pointer",
+            phase === "processing" && "bg-vox-card border-2 border-vox-purple/60",
+            phase === "agent"      && "bg-gradient-to-br from-vox-purple to-vox-blue glow-purple hover:scale-105 active:scale-95 cursor-pointer",
+            phase === "clarifying" && "bg-vox-card border-2 border-yellow-400/60",
+            phase === "confirming" && "bg-vox-card border-2 border-vox-cyan/60",
+            phase === "done"       && "bg-green-600 glow-cyan",
+            phase === "tracking"   && "bg-vox-card border-2 border-vox-cyan/60",
+            phase === "error"      && "bg-red-900 border border-red-500 cursor-pointer hover:opacity-80",
           )}>
-          {phase === "idle" && <Mic size={48} />}
-          {phase === "greeting" && (
-            <div className="flex gap-1 items-end h-8">
-              {[0,1,2,3,4].map(i => (
-                <div key={i} className="w-1 bg-white rounded-full animate-bounce"
-                     style={{ height:`${40+Math.sin(i)*20}%`, animationDelay:`${i*0.1}s` }} />
-              ))}
-            </div>
-          )}
-          {(phase === "listening" || phase === "followup_listening") && (
+          {phase === "idle"       && <Mic size={48} />}
+          {phase === "starting"   && <Loader2 size={36} className="animate-spin text-vox-purple" />}
+          {phase === "recording"  && (
             <div className="flex flex-col items-center gap-1">
               <Square size={28} className="fill-white" />
-              <span className="text-xs font-bold">{recordingSeconds}ث</span>
+              <span className="text-xs font-bold">{recSecs}ث</span>
             </div>
           )}
-          {phase === "processing"  && <div className="w-10 h-10 border-2 border-vox-purple border-t-transparent rounded-full animate-spin" />}
-          {phase === "results"     && <Mic size={36} className="text-vox-purple" />}
-          {phase === "unavailable" && <span className="text-2xl">🔍</span>}
-          {phase === "confirming"  && <div className="w-10 h-10 border-2 border-white border-t-transparent rounded-full animate-spin" />}
-          {phase === "done"        && <CheckCircle size={48} />}
-          {phase === "error"       && <RotateCcw size={36} className="text-red-400" />}
+          {phase === "processing" && <Loader2 size={36} className="animate-spin text-vox-purple" />}
+          {phase === "agent"      && <Mic size={40} />}
+          {phase === "clarifying" && <MessageSquare size={36} className="text-yellow-400" />}
+          {phase === "confirming" && <CheckCircle size={36} className="text-vox-cyan" />}
+          {phase === "done"       && <CheckCircle size={48} />}
+          {phase === "tracking"   && <Truck size={36} className="text-vox-cyan" />}
+          {phase === "error"      && <RotateCcw size={36} className="text-red-400" />}
         </button>
       </div>
 
-      {/* ── Status ────────────────────────────────────────────────────────── */}
-      <div className="text-center mb-4 min-h-[72px] px-4 w-full">
-        {phase === "idle" && (
-          <div>
-            <p className="text-white font-semibold text-base mb-0.5">اضغط وتحدث</p>
-            <p className="text-vox-muted text-xs">أو اكتب طلبك بالأسفل</p>
-          </div>
-        )}
-        {phase === "greeting" && <p className="text-vox-cyan font-semibold animate-pulse text-sm">{ttsText}</p>}
-        {phase === "listening" && (
-          <div>
-            <p className="text-red-400 font-bold animate-pulse mb-1 text-sm">🎙️ أنا أسمعك... تحدث بحرية</p>
-            <p className="text-vox-muted text-xs mb-2">اضغط الزر للإيقاف • {30 - recordingSeconds}ث متبقية</p>
-            <div className="flex gap-0.5 justify-center items-end h-6 mt-1">
-              {Array.from({ length: 20 }).map((_, i) => (
-                <div key={i} className="w-1 rounded-full bg-red-400 transition-all duration-75"
-                     style={{ height: `${Math.max(15, (audioLevel/255)*100*(0.3+Math.abs(Math.sin(i*0.7+Date.now()/200))*0.7))}%` }} />
-              ))}
-            </div>
-          </div>
-        )}
-        {phase === "followup_listening" && (
-          <div>
-            <p className="text-orange-400 font-bold animate-pulse mb-1 text-sm">🎙️ قل اختيارك...</p>
-            <p className="text-vox-muted text-xs mb-2">مثال: الأول، الثاني، الأقرب، الأرخص</p>
-            <div className="flex gap-0.5 justify-center items-end h-6 mt-1">
-              {Array.from({ length: 20 }).map((_, i) => (
-                <div key={i} className="w-1 rounded-full bg-orange-400 transition-all duration-75"
-                     style={{ height: `${Math.max(15, (audioLevel/255)*100*(0.3+Math.abs(Math.sin(i*0.7+Date.now()/200))*0.7))}%` }} />
-              ))}
-            </div>
-          </div>
-        )}
-        {phase === "processing"  && <p className="text-vox-purple animate-pulse text-sm font-semibold">جارٍ تحليل طلبك والبحث...</p>}
-        {phase === "confirming"  && <p className="text-vox-cyan animate-pulse text-sm font-semibold">جارٍ تأكيد طلبك...</p>}
-        {phase === "done" && (
-          <div className="text-center">
-            <p className="text-green-400 font-bold text-base mb-1">✅ تم تأكيد طلبك!</p>
-            {identityMsg ? (
-              <div className="mt-2 space-y-0.5">
-                <p className="text-white text-sm font-bold">{identityMsg.line1}</p>
-                <p className="text-vox-muted text-xs">{identityMsg.line2}</p>
-              </div>
-            ) : (
-              <p className="text-vox-muted text-xs">جارٍ الانتقال لتتبع الطلب...</p>
-            )}
-          </div>
-        )}
-        {phase === "error" && (
-          <div>
-            <p className="text-red-400 text-sm mb-2 font-medium">{error}</p>
-            <button onClick={reset} className="text-vox-purple text-sm font-semibold hover:underline">حاول مجدداً</button>
-          </div>
-        )}
-        {phase === "results" && transcript && (
-          <div dir="rtl">
-            <p className="text-gray-500 text-xs mb-0.5">فهمت طلبك:</p>
-            <p className="text-white text-sm font-semibold">"{transcript}"</p>
-          </div>
-        )}
-        {phase === "unavailable" && <p className="text-orange-400 text-sm font-semibold">{ttsText}</p>}
-      </div>
+      {/* ── State badge ─────────────────────────────────────────────────── */}
+      {phase !== "idle" && phase !== "error" && (
+        <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-vox-card border border-vox-border text-xs text-vox-muted">
+          {STATE_LABELS[agentState] || agentState}
+        </div>
+      )}
 
-      {/* ── TTS bubble ────────────────────────────────────────────────────── */}
-      {phase === "results" && ttsText && (
-        <div className="w-full px-2 mb-4">
-          <div className="rounded-2xl p-3.5 border border-vox-cyan/25" style={{ background:"rgba(6,182,212,0.06)" }}>
+      {/* ── TTS bubble ──────────────────────────────────────────────────── */}
+      {ttsText && phase !== "idle" && phase !== "error" && (
+        <div className="w-full px-2">
+          <div className="rounded-2xl p-3.5 border border-vox-cyan/20" style={{ background:"rgba(6,182,212,0.05)" }}>
             <div className="flex gap-2" dir="rtl">
               <span className="text-vox-cyan text-lg flex-shrink-0">🤖</span>
               <p className="text-vox-cyan text-sm leading-relaxed">{ttsText}</p>
@@ -512,142 +434,174 @@ export default function VoiceOrb({ lat = 15.3694, lng = 44.1910 }: Props) {
         </div>
       )}
 
-      {/* ── Recommendation cards ──────────────────────────────────────────── */}
-      {phase === "results" && results.length > 0 && (
-        <div className="w-full px-2 slide-up space-y-2 mb-4">
-          {results.map((r, i) => (
-            <div key={r.id}
-              className="rounded-2xl border overflow-hidden"
-              style={{
-                background: "rgba(18,18,26,0.95)",
-                borderColor: cartAdded === i ? "rgba(16,185,129,0.6)" : i===0 ? "rgba(139,92,246,0.5)" : "rgba(30,30,46,0.8)",
-                boxShadow: cartAdded === i ? "0 0 12px rgba(16,185,129,0.2)" : i===0 ? "0 0 12px rgba(139,92,246,0.15)" : "none",
-              }}>
-              {/* Header */}
-              <div className="p-3.5 pb-2">
-                <div className="flex items-center justify-between mb-1.5">
-                  <span className={clsx("text-[11px] font-bold px-2.5 py-0.5 rounded-full",
-                    cartAdded === i ? "bg-emerald-500/20 text-emerald-400" :
-                    i===0 ? "bg-vox-purple/20 text-vox-purple" :
-                    i===1 ? "bg-vox-blue/20 text-vox-blue" : "bg-vox-border text-vox-muted")}>
-                    {cartAdded === i ? "✓ في السلة" : i===0 ? "⭐ الأفضل" : i===1 ? "# الثاني" : "# الثالث"}
-                  </span>
-                  <span className="text-white font-black text-sm">{r.name_ar || r.name}</span>
-                </div>
-                <div className="flex items-center justify-end gap-3 text-xs text-vox-muted">
-                  <span className="text-yellow-400 font-semibold">⭐ {r.rating?.toFixed(1)}</span>
-                  <span>🕐 {r.estimated_eta_minutes}د</span>
-                  <span>📍 {r.distance_km?.toFixed(1)}كم</span>
-                  <span className={r.delivery_fee===0 ? "text-green-400 font-semibold" : ""}>
-                    {r.delivery_fee===0 ? "🎁 مجاني" : `توصيل ${r.delivery_fee} ريال`}
-                  </span>
-                </div>
-              </div>
+      {/* ── Recording waveform ──────────────────────────────────────────── */}
+      {phase === "recording" && (
+        <div className="flex gap-0.5 justify-center items-end h-6 px-2">
+          {Array.from({ length: 24 }).map((_, i) => (
+            <div key={i} className="w-1 rounded-full bg-red-400 transition-all duration-75"
+                 style={{ height: `${Math.max(15, (audioLevel / 255) * 100 * (0.3 + Math.abs(Math.sin(i * 0.7 + Date.now() / 200)) * 0.7))}%` }} />
+          ))}
+        </div>
+      )}
 
-              {/* Matched products */}
-              {r.items && r.items.length > 0 && (
-                <div className="px-3.5 pb-2 flex flex-wrap gap-1.5 justify-end">
-                  {r.items.slice(0,3).map((item,pi) => (
-                    <span key={pi} className={clsx("text-[11px] px-2.5 py-0.5 rounded-full border",
-                      r.has_requested_items ? "border-vox-cyan/40 text-vox-cyan bg-vox-cyan/10" : "border-vox-border text-vox-muted")}>
-                      {item.name_ar || item.name} · {item.price.toLocaleString()} ر.ي
+      {/* ── Missing items + alternatives ────────────────────────────────── */}
+      {missingItems.length > 0 && (
+        <div className="w-full px-2">
+          <div className="rounded-2xl p-3 border border-orange-400/30 bg-orange-400/5" dir="rtl">
+            <p className="text-orange-400 text-xs font-bold mb-2">⚠️ غير متوفر في هذا المطعم:</p>
+            {missingItems.map((item, i) => {
+              const altList = alts[item];
+              return (
+                <div key={i} className="mb-1.5">
+                  <span className="text-orange-300 text-xs">• {item}</span>
+                  {altList && altList.length > 0 && (
+                    <span className="text-vox-muted text-xs mr-2">
+                      → بديل: {altList[0].product_name_ar} ({altList[0].merchant_name_ar})
                     </span>
-                  ))}
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Clarification buttons ────────────────────────────────────────── */}
+      {phase === "clarifying" && clarOpts.length > 0 && (
+        <div className="w-full px-2">
+          <div className="rounded-2xl p-3 border border-yellow-400/30 bg-yellow-400/5">
+            <p className="text-yellow-400 text-xs font-bold mb-2 text-right">اختر أو قل إجابتك:</p>
+            <div className="flex flex-wrap gap-2 justify-end">
+              {clarOpts.map((opt, i) => (
+                <button key={i} onClick={() => sendClarification(opt)}
+                  className="px-3 py-2 rounded-xl text-sm font-semibold text-white bg-yellow-600/30 border border-yellow-400/50 hover:bg-yellow-600/50 transition-colors">
+                  {opt}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Order summary / confirm ──────────────────────────────────────── */}
+      {phase === "confirming" && orderDraft && (
+        <div className="w-full px-2 slide-up">
+          <div className="rounded-2xl border border-vox-cyan/30 overflow-hidden"
+               style={{ background:"rgba(6,182,212,0.05)" }}>
+            {/* Header */}
+            <div className="px-4 py-3 border-b border-vox-cyan/20 flex items-center justify-between" dir="rtl">
+              <span className="text-white font-black text-sm">{orderDraft.merchant_name_ar}</span>
+              <div className="flex items-center gap-3 text-xs text-vox-muted">
+                <span className="flex items-center gap-1"><Clock size={11} />{orderDraft.eta_minutes}د</span>
+                {coverage < 1 && (
+                  <span className="text-orange-400">{Math.round(coverage * 100)}% تغطية</span>
+                )}
+              </div>
+            </div>
+
+            {/* Items */}
+            <div className="px-4 py-2 space-y-1" dir="rtl">
+              {orderDraft.items.map((it, i) => (
+                <div key={i} className="flex items-center justify-between text-sm">
+                  <span className="text-gray-400 text-xs">{it.qty > 1 ? `×${it.qty}` : ""} {it.unit_price.toLocaleString()} ر.ي</span>
+                  <span className="text-white font-medium">{it.name_ar}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Totals */}
+            <div className="px-4 py-3 border-t border-vox-cyan/20 space-y-1" dir="rtl">
+              <div className="flex justify-between text-xs text-vox-muted">
+                <span>{orderDraft.subtotal.toLocaleString()} ر.ي</span><span>المجموع الجزئي</span>
+              </div>
+              {orderDraft.delivery_fee > 0 && (
+                <div className="flex justify-between text-xs text-vox-muted">
+                  <span>{orderDraft.delivery_fee.toLocaleString()} ر.ي</span><span>التوصيل</span>
                 </div>
               )}
-
-              {/* Action buttons */}
-              <div className="flex border-t border-white/5">
-                <button
-                  onClick={() => addRecommendationToCart(r, i)}
-                  disabled={cartAdded === i || !r.items?.length}
-                  className={clsx(
-                    "flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-bold transition-all border-r border-white/5",
-                    cartAdded === i
-                      ? "text-emerald-400 bg-emerald-500/10"
-                      : "text-vox-cyan hover:bg-vox-cyan/10",
-                  )}>
-                  <ShoppingCart size={12} />
-                  {cartAdded === i ? "أُضيف للسلة" : "أضف للسلة"}
-                </button>
-                <button
-                  onClick={() => confirmOrder(i)}
-                  className="flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-bold text-white hover:bg-vox-purple/20 transition-all">
-                  <Zap size={12} className="text-vox-purple" />
-                  اطلب مباشرة
-                </button>
+              <div className="flex justify-between text-xs text-vox-muted">
+                <span>{orderDraft.service_fee.toLocaleString()} ر.ي</span><span>رسوم الخدمة</span>
+              </div>
+              <div className="flex justify-between font-black text-white text-base pt-1 border-t border-vox-cyan/20">
+                <span>{orderDraft.total.toLocaleString()} ر.ي</span><span>الإجمالي</span>
               </div>
             </div>
-          ))}
 
-          {/* Cart quick-link if items added */}
-          {cartAdded !== null && (
-            <button
-              onClick={() => router.push("/cart")}
-              className="w-full flex items-center justify-center gap-2 py-3 rounded-2xl text-white text-sm font-black"
-              style={{ background: "linear-gradient(135deg, #10B981, #059669)", boxShadow: "0 0 16px rgba(16,185,129,0.4)" }}>
-              <ShoppingCart size={14} />
-              عرض السلة وتأكيد الطلب
-            </button>
-          )}
-
-          {/* Multi-turn: voice follow-up */}
-          <div className="flex gap-2">
-            <button onClick={startFollowup}
-              className="flex-1 flex items-center justify-center gap-2 bg-orange-600/15 border border-orange-500/30 text-orange-400 rounded-2xl py-2.5 text-sm font-semibold hover:bg-orange-600/25 transition-colors">
-              <Mic size={14} /> قل اختيارك
-            </button>
-            <button onClick={reset}
-              className="flex items-center justify-center gap-2 text-vox-muted text-sm px-4 py-2.5 hover:text-white transition-colors">
-              <X size={14} /> إلغاء
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ── Unavailable ───────────────────────────────────────────────────── */}
-      {phase === "unavailable" && (
-        <div className="w-full px-2 slide-up mb-4">
-          <div className="rounded-2xl p-4 border border-orange-400/20 bg-orange-400/5 text-center">
-            <p className="text-orange-300 text-sm mb-3">لم نجد ما تبحث عنه.</p>
-            <div className="flex gap-2 mb-2">
-              <button onClick={reset} className="flex-1 border border-vox-border text-vox-muted rounded-xl py-2.5 text-sm hover:border-red-500/50 hover:text-red-400 transition-colors">إلغاء</button>
-              <button onClick={() => { reset(); setTimeout(startSession, 150); }}
-                className="flex-1 bg-vox-purple rounded-xl py-2.5 text-white text-sm font-semibold">اطلب آخر</button>
+            {/* Actions */}
+            <div className="flex border-t border-vox-cyan/20">
+              <button onClick={cancelOrder}
+                className="flex-1 py-3 text-sm text-vox-muted hover:text-red-400 transition-colors border-r border-vox-cyan/20">
+                ✗ إلغاء
+              </button>
+              <button onClick={confirmOrder}
+                className="flex-1 py-3 text-sm font-black text-white hover:bg-vox-cyan/10 transition-colors"
+                style={{ color:"#06B6D4" }}>
+                ✓ تأكيد الطلب
+              </button>
             </div>
-            {/* Concierge fallback */}
-            <button onClick={() => setShowConcierge(true)}
-              className="w-full flex items-center justify-center gap-2 border border-vox-cyan/30 text-vox-cyan rounded-xl py-2.5 text-sm hover:bg-vox-cyan/10 transition-colors">
-              🎧 طلب مخصص — فريقنا يساعدك
+          </div>
+        </div>
+      )}
+
+      {/* ── Done / Tracking ──────────────────────────────────────────────── */}
+      {phase === "done" && orderNumber && (
+        <div className="w-full px-2">
+          <div className="rounded-2xl p-4 border border-green-500/40 bg-green-500/5 text-center" dir="rtl">
+            <p className="text-green-400 font-black text-base mb-1">✅ تم تأكيد الطلب!</p>
+            <p className="text-vox-muted text-xs mb-3">رقم الطلب: {orderNumber}</p>
+            <button onClick={() => router.push(`/orders/${orderId}`)}
+              className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-bold text-white bg-green-600/30 border border-green-500/40 hover:bg-green-600/50 transition-colors">
+              <Truck size={14} /> تتبع الطلب
             </button>
           </div>
         </div>
       )}
 
-      {/* ── Text input ────────────────────────────────────────────────────── */}
-      {(phase === "idle" || phase === "error") && (
+      {/* ── Error ────────────────────────────────────────────────────────── */}
+      {phase === "error" && (
+        <div className="w-full px-2 text-center">
+          <p className="text-red-400 text-sm mb-3">{error}</p>
+          <button onClick={reset}
+            className="text-vox-purple text-sm font-semibold hover:underline">
+            حاول مجدداً
+          </button>
+        </div>
+      )}
+
+      {/* ── Tap hint when agent is ready ─────────────────────────────────── */}
+      {phase === "agent" && (
+        <div className="text-center">
+          <p className="text-vox-muted text-xs">اضغط الزر وتحدث</p>
+        </div>
+      )}
+
+      {/* ── Text input (idle + error) ─────────────────────────────────────── */}
+      {(phase === "idle" || phase === "agent" || phase === "error") && (
         <div className="w-full px-2">
           <div className="flex gap-2">
             <button onClick={submitText} disabled={!textInput.trim()}
               className="bg-vox-purple hover:bg-vox-purple-dark disabled:opacity-40 rounded-xl px-4 py-3 text-white text-sm font-semibold transition-colors flex-shrink-0">
               إرسال
             </button>
-            <input value={textInput} onChange={e => setTextInput(e.target.value)}
+            <input
+              value={textInput}
+              onChange={e => setTextInput(e.target.value)}
               onKeyDown={e => e.key === "Enter" && submitText()}
-              placeholder="مثال: ابغى زنجر، لاتيه، فيتامين سي..."
+              placeholder="مثال: أبغى برياني دجاج وبطاطس كبيرة..."
               className="flex-1 bg-vox-card border border-vox-border rounded-xl px-4 py-3 text-white text-sm placeholder-vox-muted focus:outline-none focus:border-vox-purple transition-colors text-right min-w-0"
-              dir="rtl" />
+              dir="rtl"
+            />
           </div>
         </div>
       )}
 
-      {/* ── Concierge Modal ───────────────────────────────────────────────── */}
-      <ConciergeModal
-        open={showConcierge}
-        initialText={lastTranscript}
-        onClose={() => setShowConcierge(false)}
-        onSpeak={text => speak(text, "ar-SA")}
-      />
+      {/* ── Reset button ─────────────────────────────────────────────────── */}
+      {!["idle","error"].includes(phase) && (
+        <button onClick={reset}
+          className="flex items-center gap-1.5 text-vox-muted text-xs hover:text-white transition-colors py-1">
+          <X size={12} /> بدء من جديد
+        </button>
+      )}
     </div>
   );
 }

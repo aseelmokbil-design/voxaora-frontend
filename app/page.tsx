@@ -233,14 +233,23 @@ export default function HomePage() {
           <div className="fixed inset-0 z-50 flex items-end justify-center"
                style={{ background: "rgba(0,0,0,0.75)", backdropFilter: "blur(10px)" }}
                onClick={() => setShowVoice(false)}>
-            <div className="w-full max-w-[430px] rounded-t-3xl p-6"
-                 style={{ background: "#0A0A0F", border: "1px solid rgba(109,40,255,0.3)" }}
+            <div className="w-full max-w-[430px] rounded-t-3xl flex flex-col"
+                 style={{
+                   background: "#0A0A0F",
+                   border: "1px solid rgba(109,40,255,0.3)",
+                   maxHeight: "90dvh",
+                 }}
                  onClick={e => e.stopPropagation()}>
-              <div className="flex justify-between items-center mb-4">
+              {/* Header — fixed */}
+              <div className="flex justify-between items-center px-6 pt-5 pb-3 flex-shrink-0">
                 <button onClick={() => setShowVoice(false)} className="text-vox-muted text-sm">إغلاق</button>
                 <p className="text-white font-bold">المساعد الصوتي</p>
+                <div className="w-10" />
               </div>
-              <VoiceOrb lat={lat} lng={lng} />
+              {/* Scrollable content */}
+              <div className="overflow-y-auto px-6 pb-8">
+                <VoiceOrb lat={lat} lng={lng} />
+              </div>
             </div>
           </div>
         )}

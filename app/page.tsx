@@ -247,7 +247,7 @@ export default function HomePage() {
                 <div className="w-10" />
               </div>
               {/* Scrollable content */}
-              <div className="overflow-y-auto px-6 pb-8">
+              <div className="overflow-y-auto px-6 pb-8 flex-1 min-h-0 overscroll-contain">
                 <VoiceOrb lat={lat} lng={lng} />
               </div>
             </div>

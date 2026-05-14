@@ -2,11 +2,12 @@
 import { useEffect, useState } from "react";
 import { useAuth } from "@/context/AuthContext";
 import VoiceOrb from "@/components/VoiceOrb";
+import CallMode from "@/components/CallMode";
 import BottomNav from "@/components/BottomNav";
-import { merchantApi, intelligenceApi, statsApi, dealApi, Merchant, ReorderSuggestion, LiveStats, PublicDeal } from "@/lib/api";
+import { merchantApi, intelligenceApi, statsApi, dealApi, agentApi, Merchant, ReorderSuggestion, LiveStats, PublicDeal } from "@/lib/api";
 import Link from "next/link";
 import Image from "next/image";
-import { Search, MapPin, Clock, Star, ShoppingBag, Heart, ChevronLeft, Mic, User } from "lucide-react";
+import { Search, MapPin, Clock, Star, ShoppingBag, Heart, ChevronLeft, Mic, User, Phone } from "lucide-react";
 import NotificationBell from "@/components/NotificationBell";
 import { useCart } from "@/context/CartContext";
 
@@ -55,7 +56,10 @@ export default function HomePage() {
   const [lng, setLng] = useState(DEFAULT_LNG);
   const [reorderSuggestions, setReorderSuggestions] = useState<ReorderSuggestion[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
-  const [showVoice, setShowVoice] = useState(false);
+  const [showVoice, setShowVoice]         = useState(false);
+  const [showCallMode, setShowCallMode]   = useState(false);
+  const [callSessionId, setCallSessionId] = useState<string | null>(null);
+  const [startingCall, setStartingCall]   = useState(false);
   const [heroDot, setHeroDot] = useState(0);
   const [liveStats, setLiveStats] = useState<LiveStats | null>(null);
   const [featuredDeals, setFeaturedDeals] = useState<PublicDeal[]>([]);
@@ -95,6 +99,20 @@ export default function HomePage() {
   }, []);
 
   const topMerchants = merchants.slice(0, 10);
+
+  const startCall = async () => {
+    if (startingCall || !user) return;
+    setStartingCall(true);
+    try {
+      const res = await agentApi.startSession(lat, lng);
+      setCallSessionId(res.session_id);
+      setShowCallMode(true);
+    } catch {
+      // ignore — VoiceOrb fallback still available
+    } finally {
+      setStartingCall(false);
+    }
+  };
 
   return (
     <div className="pb-28 bg-[#0A0A0F] min-h-dvh">
@@ -204,12 +222,21 @@ export default function HomePage() {
             </p>
             <div className="flex items-center gap-3">
               <button
-                onClick={() => setShowVoice(true)}
-                className="flex items-center gap-2 rounded-2xl px-5 py-3 font-bold text-white text-sm"
+                onClick={startCall}
+                disabled={startingCall}
+                className="flex items-center gap-2 rounded-2xl px-5 py-3 font-bold text-white text-sm transition-all active:scale-95 disabled:opacity-60"
                 style={{ background: "linear-gradient(135deg, #6D28FF, #A855F7)", boxShadow: "0 0 20px rgba(109,40,255,0.5)" }}
               >
+                <Phone size={16} />
+                {startingCall ? "جاري الاتصال..." : "اتصل الآن"}
+              </button>
+              <button
+                onClick={() => setShowVoice(true)}
+                className="flex items-center gap-2 rounded-2xl px-4 py-3 font-bold text-white/70 text-sm"
+                style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}
+              >
                 <Mic size={16} />
-                جرب الآن
+                جرب
               </button>
             </div>
           </div>
@@ -463,6 +490,14 @@ export default function HomePage() {
       </div>
 
       <BottomNav onVoiceTap={() => setShowVoice(true)} />
+
+      {/* Full-screen Call Mode */}
+      {showCallMode && callSessionId && (
+        <CallMode
+          sessionId={callSessionId}
+          onEnd={() => { setShowCallMode(false); setCallSessionId(null); }}
+        />
+      )}
     </div>
   );
 }

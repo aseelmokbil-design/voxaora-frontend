@@ -59,6 +59,7 @@ export default function HomePage() {
   const [showVoice, setShowVoice]         = useState(false);
   const [showCallMode, setShowCallMode]   = useState(false);
   const [callSessionId, setCallSessionId] = useState<string | null>(null);
+  const [callStream, setCallStream]       = useState<MediaStream | null>(null);
   const [startingCall, setStartingCall]   = useState(false);
   const [heroDot, setHeroDot] = useState(0);
   const [liveStats, setLiveStats] = useState<LiveStats | null>(null);
@@ -104,11 +105,18 @@ export default function HomePage() {
     if (startingCall || !user) return;
     setStartingCall(true);
     try {
-      const res = await agentApi.startSession(lat, lng);
+      // Request mic HERE — directly in click handler, so browser grants it as user gesture
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const res    = await agentApi.startSession(lat, lng);
+      setCallStream(stream);
       setCallSessionId(res.session_id);
       setShowCallMode(true);
-    } catch {
-      // ignore — VoiceOrb fallback still available
+    } catch (err: unknown) {
+      const name = (err as { name?: string }).name;
+      if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+        alert("يرجى السماح بالوصول إلى الميكروفون من إعدادات المتصفح ثم أعد المحاولة.");
+      }
+      // leave call mode closed
     } finally {
       setStartingCall(false);
     }
@@ -492,10 +500,16 @@ export default function HomePage() {
       <BottomNav onVoiceTap={() => setShowVoice(true)} />
 
       {/* Full-screen Call Mode */}
-      {showCallMode && callSessionId && (
+      {showCallMode && callSessionId && callStream && (
         <CallMode
           sessionId={callSessionId}
-          onEnd={() => { setShowCallMode(false); setCallSessionId(null); }}
+          stream={callStream}
+          onEnd={() => {
+            setShowCallMode(false);
+            setCallSessionId(null);
+            callStream.getTracks().forEach(t => t.stop());
+            setCallStream(null);
+          }}
         />
       )}
     </div>

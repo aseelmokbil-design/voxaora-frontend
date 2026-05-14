@@ -36,7 +36,8 @@ export default function CallMode({ sessionId, stream, onEnd }: Props) {
   const isSpeakingRef  = useRef(false);
   const bargeInSentRef = useRef(false);
   const playingRef     = useRef(false);
-  const audioQueueRef  = useRef<AudioBuffer[]>([]);
+  const audioQueueRef  = useRef<string[]>([]);        // queue of base64 MP3 strings
+  const currentAudio   = useRef<HTMLAudioElement | null>(null);
 
   const [callState, setCallState]     = useState<CallState>("connecting");
   const [ttsText, setTtsText]         = useState("");
@@ -53,49 +54,42 @@ export default function CallMode({ sessionId, stream, onEnd }: Props) {
     return () => clearInterval(t);
   }, []);
 
-  // ── Audio playback ─────────────────────────────────────────────────────────
-  const playNext = useCallback(async () => {
-    const ctx = audioCtxRef.current;
-    if (!ctx || audioQueueRef.current.length === 0) {
-      playingRef.current = false;
+  // ── Audio playback via HTMLAudioElement (plays through loudspeaker on mobile) ─
+  const playNext = useCallback(() => {
+    if (audioQueueRef.current.length === 0) {
+      playingRef.current    = false;
+      isSpeakingRef.current = false;
+      wsRef.current?.send(JSON.stringify({ type: "speaking_done" }));
+      setCallState("listening");
       return;
     }
-    playingRef.current = true;                          // set before any await
-    if (ctx.state !== "running") await ctx.resume();   // unblock autoplay policy
-    const buf = audioQueueRef.current.shift()!;
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(ctx.destination);
-    src.onended = () => {
-      if (audioQueueRef.current.length > 0) {
-        playNext();
-      } else {
-        playingRef.current    = false;
-        isSpeakingRef.current = false;
-        wsRef.current?.send(JSON.stringify({ type: "speaking_done" }));
-        setCallState("listening");
-      }
+    playingRef.current = true;
+    const b64   = audioQueueRef.current.shift()!;
+    const audio = new Audio(`data:audio/mp3;base64,${b64}`);
+    audio.volume = 1.0;
+    currentAudio.current = audio;
+    audio.onended = () => {
+      currentAudio.current = null;
+      playNext();
     };
-    src.start();
+    audio.onerror = () => {
+      currentAudio.current = null;
+      playNext();
+    };
+    audio.play().catch(() => playNext());
   }, []);
 
-  const enqueueAudio = useCallback(async (b64: string) => {
-    const ctx = audioCtxRef.current;
-    if (!ctx || !b64) return;
-    try {
-      if (ctx.state !== "running") await ctx.resume();  // unblock before decode too
-      const raw  = atob(b64);
-      const arr  = new Uint8Array(raw.length);
-      for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-      const buf  = await ctx.decodeAudioData(arr.buffer);
-      audioQueueRef.current.push(buf);
-      if (!playingRef.current) playNext();
-    } catch (e) {
-      console.error("audio decode/play failed", e);
-    }
+  const enqueueAudio = useCallback((b64: string) => {
+    if (!b64) return;
+    audioQueueRef.current.push(b64);
+    if (!playingRef.current) playNext();
   }, [playNext]);
 
   const stopPlayback = useCallback(() => {
+    if (currentAudio.current) {
+      currentAudio.current.pause();
+      currentAudio.current = null;
+    }
     audioQueueRef.current = [];
     playingRef.current    = false;
     isSpeakingRef.current = false;
@@ -140,7 +134,7 @@ export default function CallMode({ sessionId, stream, onEnd }: Props) {
         if (b64) {
           isSpeakingRef.current = true;
           setCallState("speaking");
-          await enqueueAudio(b64);
+          enqueueAudio(b64);
         } else {
           setCallState("listening");
         }
@@ -154,12 +148,13 @@ export default function CallMode({ sessionId, stream, onEnd }: Props) {
     // ── AudioWorklet with the pre-acquired AudioContext + stream ──────────
     (async () => {
       try {
-        // Reuse the AudioContext created in the click handler (already running)
+        // Reuse the AudioContext created in the click handler (already unlocked)
         const w   = window as unknown as Record<string, unknown>;
         const ctx = (w.__vox_audioCtx as AudioContext) ?? new AudioContext();
         delete w.__vox_audioCtx;
         audioCtxRef.current = ctx;
         if (ctx.state !== "running") await ctx.resume();
+        // Note: ctx is used ONLY for mic capture/worklet — playback uses HTMLAudioElement
 
         await ctx.audioWorklet.addModule("/audio-processor.js");
         const worklet = new AudioWorkletNode(ctx, "audio-processor");

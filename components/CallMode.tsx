@@ -54,13 +54,14 @@ export default function CallMode({ sessionId, stream, onEnd }: Props) {
   }, []);
 
   // ── Audio playback ─────────────────────────────────────────────────────────
-  const playNext = useCallback(() => {
+  const playNext = useCallback(async () => {
     const ctx = audioCtxRef.current;
     if (!ctx || audioQueueRef.current.length === 0) {
       playingRef.current = false;
       return;
     }
-    playingRef.current = true;
+    playingRef.current = true;                          // set before any await
+    if (ctx.state !== "running") await ctx.resume();   // unblock autoplay policy
     const buf = audioQueueRef.current.shift()!;
     const src = ctx.createBufferSource();
     src.buffer = buf;
@@ -82,6 +83,7 @@ export default function CallMode({ sessionId, stream, onEnd }: Props) {
     const ctx = audioCtxRef.current;
     if (!ctx || !b64) return;
     try {
+      if (ctx.state !== "running") await ctx.resume();  // unblock before decode too
       const raw  = atob(b64);
       const arr  = new Uint8Array(raw.length);
       for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
@@ -89,7 +91,7 @@ export default function CallMode({ sessionId, stream, onEnd }: Props) {
       audioQueueRef.current.push(buf);
       if (!playingRef.current) playNext();
     } catch (e) {
-      console.error("audio decode failed", e);
+      console.error("audio decode/play failed", e);
     }
   }, [playNext]);
 
@@ -149,11 +151,15 @@ export default function CallMode({ sessionId, stream, onEnd }: Props) {
       }
     };
 
-    // ── AudioWorklet with the pre-acquired stream ──────────────────────────
+    // ── AudioWorklet with the pre-acquired AudioContext + stream ──────────
     (async () => {
       try {
-        const ctx = new AudioContext();
+        // Reuse the AudioContext created in the click handler (already running)
+        const w   = window as unknown as Record<string, unknown>;
+        const ctx = (w.__vox_audioCtx as AudioContext) ?? new AudioContext();
+        delete w.__vox_audioCtx;
         audioCtxRef.current = ctx;
+        if (ctx.state !== "running") await ctx.resume();
 
         await ctx.audioWorklet.addModule("/audio-processor.js");
         const worklet = new AudioWorkletNode(ctx, "audio-processor");

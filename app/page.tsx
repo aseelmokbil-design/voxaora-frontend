@@ -105,9 +105,15 @@ export default function HomePage() {
     if (startingCall || !user) return;
     setStartingCall(true);
     try {
-      // Request mic HERE — directly in click handler, so browser grants it as user gesture
+      // Create AudioContext + getUserMedia HERE in the click handler
+      // so the browser grants permission and audio policy is satisfied immediately
+      const audioCtx = new AudioContext();
+      await audioCtx.resume();   // unlock autoplay before any async gap
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       const res    = await agentApi.startSession(lat, lng);
+      // store as window refs so CallMode can grab them without prop-drilling complexity
+      (window as unknown as Record<string, unknown>).__vox_audioCtx = audioCtx;
+      (window as unknown as Record<string, unknown>).__vox_stream   = stream;
       setCallStream(stream);
       setCallSessionId(res.session_id);
       setShowCallMode(true);
@@ -116,7 +122,6 @@ export default function HomePage() {
       if (name === "NotAllowedError" || name === "PermissionDeniedError") {
         alert("يرجى السماح بالوصول إلى الميكروفون من إعدادات المتصفح ثم أعد المحاولة.");
       }
-      // leave call mode closed
     } finally {
       setStartingCall(false);
     }

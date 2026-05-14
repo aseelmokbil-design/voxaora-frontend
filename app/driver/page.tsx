@@ -44,6 +44,24 @@ export default function DriverHomePage() {
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
+  // Poll available orders every 20 s when driver is online and has no active order
+  useEffect(() => {
+    if (!profile || profile.status !== "available" || currentOrder) return;
+    const interval = setInterval(async () => {
+      try {
+        const avail = await driverApi.availableOrders();
+        setAvailable(avail.orders);
+        // Surface any new ones not yet seen
+        avail.orders.forEach(o => {
+          if (!newOrderIds.current.has(o.id)) {
+            newOrderIds.current.add(o.id);
+          }
+        });
+      } catch { /* ignore */ }
+    }, 20000);
+    return () => clearInterval(interval);
+  }, [profile, currentOrder]);
+
   // Handle new order via WebSocket
   const handleNewOrder = useCallback((order: DriverAvailableOrder) => {
     if (newOrderIds.current.has(order.id)) return;

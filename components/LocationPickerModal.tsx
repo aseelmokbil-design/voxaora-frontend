@@ -1,161 +1,266 @@
 "use client";
-import { useState, useEffect } from "react";
-import { MapPin, Navigation, X, Loader2, CheckCircle2 } from "lucide-react";
-import { addressApi, Address } from "@/lib/api";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { X, MapPin, Loader2, Navigation } from "lucide-react";
+import { addressApi } from "@/lib/api";
 
 interface PickedLocation {
+  lat: number;
+  lng: number;
   full_address: string;
   city: string;
   district: string;
-  lat: number;
-  lng: number;
 }
 
 interface Props {
-  onConfirm: (addrId: string, location: PickedLocation) => void;
+  onConfirm: (addressId: string, location: PickedLocation) => void;
   onClose: () => void;
 }
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+async function reverseGeocode(lat: number, lng: number): Promise<{ full_address: string; city: string; district: string }> {
+  try {
+    const res = await fetch(
+      `${API_BASE}/api/v1/users/geocode/reverse?lat=${lat}&lng=${lng}`,
+      { headers: { Authorization: `Bearer ${localStorage.getItem("vox_token") ?? ""}` } }
+    );
+    if (res.ok) return await res.json();
+  } catch { /* ignore */ }
+  return { full_address: "", city: "", district: "" };
+}
+
 export default function LocationPickerModal({ onConfirm, onClose }: Props) {
-  const [tab, setTab] = useState<"saved" | "new">("saved");
-  const [addresses, setAddresses] = useState<Address[]>([]);
-  const [loadingAddrs, setLoadingAddrs] = useState(true);
-  const [locating, setLocating] = useState(false);
-  const [locError, setLocError] = useState("");
+  const mapRef       = useRef<HTMLDivElement>(null);
+  const leafletMap   = useRef<import("leaflet").Map | null>(null);
+  const markerRef    = useRef<import("leaflet").Marker | null>(null);
 
-  // manual form
-  const [label, setLabel] = useState("منزلي");
-  const [fullAddress, setFullAddress] = useState("");
-  const [city, setCity] = useState("صنعاء");
+  const [lat, setLat]           = useState<number | null>(null);
+  const [lng, setLng]           = useState<number | null>(null);
+  const [address, setAddress]   = useState("");
+  const [city, setCity]         = useState("");
   const [district, setDistrict] = useState("");
-  const [lat, setLat] = useState<number | null>(null);
-  const [lng, setLng] = useState<number | null>(null);
+  const [geocoding, setGeocoding] = useState(false);
+  const [locating,  setLocating]  = useState(false);
+  const [saving,    setSaving]    = useState(false);
+  const [label,     setLabel]     = useState("منزل");
 
-  useEffect(() => {
-    addressApi.list()
-      .then(a => { setAddresses(a); if (a.length === 0) setTab("new"); })
-      .catch(() => setTab("new"))
-      .finally(() => setLoadingAddrs(false));
+  const updateAddressFromCoords = useCallback(async (lat: number, lng: number) => {
+    setGeocoding(true);
+    const geo = await reverseGeocode(lat, lng);
+    setAddress(geo.full_address);
+    setCity(geo.city);
+    setDistrict(geo.district);
+    setGeocoding(false);
   }, []);
 
-  const pickSaved = (addr: Address) => {
-    onConfirm(addr.id, {
-      full_address: addr.full_address,
-      city: addr.city,
-      district: addr.district ?? "",
-      lat: addr.latitude,
-      lng: addr.longitude,
-    });
-  };
+  // ── Init Leaflet map ───────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!mapRef.current || leafletMap.current) return;
 
-  const useGPS = () => {
-    if (!navigator.geolocation) { setLocError("المتصفح لا يدعم GPS"); return; }
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const L = require("leaflet") as typeof import("leaflet");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    delete (L.Icon.Default.prototype as any)._getIconUrl;
+    L.Icon.Default.mergeOptions({
+      iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
+      iconUrl:       "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
+      shadowUrl:     "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
+    });
+
+    // Default center: Sanaa
+    const defaultLat = 15.3694;
+    const defaultLng = 44.1910;
+
+    const map = L.map(mapRef.current, {
+      center: [defaultLat, defaultLng],
+      zoom: 15,
+      zoomControl: true,
+    });
+    leafletMap.current = map;
+
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+      maxZoom: 19,
+    }).addTo(map);
+
+    // Draggable pin marker
+    const markerIcon = L.divIcon({
+      html: `<div style="font-size:40px;line-height:1;filter:drop-shadow(0 3px 10px rgba(109,40,255,.8))">📍</div>`,
+      className: "",
+      iconAnchor: [20, 40],
+    });
+
+    const marker = L.marker([defaultLat, defaultLng], { icon: markerIcon, draggable: true }).addTo(map);
+    markerRef.current = marker;
+
+    marker.on("dragend", () => {
+      const pos = marker.getLatLng();
+      setLat(pos.lat);
+      setLng(pos.lng);
+      updateAddressFromCoords(pos.lat, pos.lng);
+    });
+
+    // Click on map moves pin
+    map.on("click", (e) => {
+      marker.setLatLng(e.latlng);
+      setLat(e.latlng.lat);
+      setLng(e.latlng.lng);
+      updateAddressFromCoords(e.latlng.lat, e.latlng.lng);
+    });
+
+    // Auto-detect GPS on open
+    if (navigator.geolocation) {
+      setLocating(true);
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const { latitude, longitude } = pos.coords;
+          map.setView([latitude, longitude], 16);
+          marker.setLatLng([latitude, longitude]);
+          setLat(latitude);
+          setLng(longitude);
+          updateAddressFromCoords(latitude, longitude);
+          setLocating(false);
+        },
+        () => {
+          setLocating(false);
+          setLat(defaultLat);
+          setLng(defaultLng);
+          updateAddressFromCoords(defaultLat, defaultLng);
+        },
+        { enableHighAccuracy: true, timeout: 8000 },
+      );
+    } else {
+      setLat(defaultLat);
+      setLng(defaultLng);
+      updateAddressFromCoords(defaultLat, defaultLng);
+    }
+
+    return () => {
+      map.remove();
+      leafletMap.current = null;
+      markerRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const locateMe = () => {
+    if (!navigator.geolocation || !leafletMap.current || !markerRef.current) return;
     setLocating(true);
-    setLocError("");
     navigator.geolocation.getCurrentPosition(
-      pos => {
-        setLat(pos.coords.latitude);
-        setLng(pos.coords.longitude);
+      (pos) => {
+        const { latitude, longitude } = pos.coords;
+        leafletMap.current!.setView([latitude, longitude], 17);
+        markerRef.current!.setLatLng([latitude, longitude]);
+        setLat(latitude);
+        setLng(longitude);
+        updateAddressFromCoords(latitude, longitude);
         setLocating(false);
-        setTab("new");
       },
-      () => { setLocError("تعذّر تحديد موقعك، أدخله يدوياً"); setLocating(false); }
+      () => setLocating(false),
+      { enableHighAccuracy: true, timeout: 8000 },
     );
   };
 
-  const confirmNew = () => {
-    if (!fullAddress.trim() || !city.trim()) return;
-    onConfirm("__temp__", {
-      full_address: fullAddress.trim(),
-      city: city.trim(),
-      district: district.trim(),
-      lat: lat ?? 15.3694,
-      lng: lng ?? 44.1910,
-    });
+  const confirm = async () => {
+    if (!lat || !lng) return;
+    setSaving(true);
+    try {
+      const saved = await addressApi.add({
+        label,
+        full_address: address,
+        city,
+        district,
+        latitude: lat,
+        longitude: lng,
+        is_default: false,
+      });
+      onConfirm(saved.id, { lat, lng, full_address: address, city, district });
+    } catch {
+      // If API fails, still pass coords to parent
+      onConfirm("__temp__", { lat, lng, full_address: address, city, district });
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(0,0,0,0.7)", backdropFilter: "blur(4px)" }}>
-      <div className="w-full max-w-[430px] rounded-t-3xl overflow-hidden"
-           style={{ background: "#0A0A0F", border: "1px solid rgba(255,255,255,0.08)" }}>
+    <div className="fixed inset-0 z-50 flex flex-col" style={{ background: "rgba(5,5,15,0.97)" }}>
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 pt-10 pb-3 flex-shrink-0">
+        <button onClick={onClose}>
+          <X size={22} className="text-white/60" />
+        </button>
+        <h2 className="text-white font-black text-base">حدد موقعك بدقة</h2>
+        <div className="w-6" />
+      </div>
 
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 pt-5 pb-3">
-          <button onClick={onClose}><X size={20} className="text-vox-muted" /></button>
-          <h2 className="text-white font-black text-base">موقع التوصيل</h2>
-          <div className="w-5" />
-        </div>
+      {/* Instructions */}
+      <p className="text-white/40 text-xs text-center px-6 pb-2 flex-shrink-0">
+        اسحب الدبوس 📍 أو اضغط على الخريطة لتحديد موقعك بدقة
+      </p>
 
-        {/* GPS button */}
-        <div className="px-5 mb-4">
-          <button onClick={useGPS} disabled={locating}
-            className="w-full flex items-center justify-center gap-2 py-3.5 rounded-2xl font-bold text-sm transition-all active:scale-95 disabled:opacity-60"
-            style={{ background: "rgba(109,40,255,0.18)", color: "#A855F7", border: "2px solid rgba(109,40,255,0.4)" }}>
-            {locating ? <Loader2 size={16} className="animate-spin" /> : <Navigation size={16} />}
-            {locating ? "جارٍ تحديد موقعك..." : "استخدام موقعي الحالي (GPS)"}
-          </button>
-          {lat && !locating && (
-            <p className="text-green-400 text-xs text-center mt-1.5">
-              <CheckCircle2 size={11} className="inline mr-1" />
-              تم تحديد الموقع — أكمل بيانات العنوان أدناه
-            </p>
-          )}
-          {locError && <p className="text-red-400 text-xs text-center mt-1.5">{locError}</p>}
-        </div>
+      {/* Map */}
+      <div className="relative flex-1 mx-4 rounded-2xl overflow-hidden" style={{ minHeight: 0 }}>
+        <div ref={mapRef} style={{ height: "100%", width: "100%" }} />
 
-        {/* Tabs */}
-        {addresses.length > 0 && (
-          <div className="flex mx-5 mb-3 rounded-xl overflow-hidden border border-vox-border">
-            {(["saved", "new"] as const).map(t => (
-              <button key={t} onClick={() => setTab(t)}
-                className={`flex-1 py-2.5 text-sm font-bold transition-colors ${
-                  tab === t ? "bg-vox-purple text-white" : "text-vox-muted"
-                }`}>
-                {t === "saved" ? "عناوين محفوظة" : "عنوان جديد"}
-              </button>
-            ))}
-          </div>
-        )}
+        {/* Locate me button */}
+        <button
+          onClick={locateMe}
+          disabled={locating}
+          className="absolute bottom-4 left-4 z-[1000] flex items-center gap-1.5 px-3 py-2 rounded-xl font-bold text-xs transition-all"
+          style={{ background: "rgba(109,40,255,0.9)", color: "#fff", border: "1px solid rgba(109,40,255,0.5)" }}
+        >
+          {locating
+            ? <Loader2 size={13} className="animate-spin" />
+            : <Navigation size={13} />}
+          موقعي الحالي
+        </button>
+      </div>
 
-        <div className="px-5 pb-6 max-h-[50vh] overflow-y-auto">
-          {tab === "saved" && (
-            <div className="space-y-2">
-              {loadingAddrs ? (
-                <div className="flex justify-center py-6"><Loader2 size={22} className="animate-spin text-vox-purple" /></div>
-              ) : addresses.map(a => (
-                <button key={a.id} onClick={() => pickSaved(a)}
-                  className="w-full p-3.5 rounded-2xl border border-vox-border text-right hover:border-vox-purple transition-all active:scale-[0.98] flex items-start gap-3"
-                  style={{ background: "rgba(255,255,255,0.03)" }}>
-                  <MapPin size={16} className="text-vox-purple mt-0.5 flex-shrink-0" />
-                  <div>
-                    <p className="text-white font-semibold text-sm">{a.label}</p>
-                    <p className="text-vox-muted text-xs mt-0.5 leading-relaxed">{a.full_address}</p>
-                  </div>
-                  {a.is_default && <span className="ml-auto text-[10px] text-vox-purple font-bold">افتراضي</span>}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {tab === "new" && (
-            <div className="space-y-3">
-              <input value={label} onChange={e => setLabel(e.target.value)} placeholder="اسم العنوان (منزل، عمل...)" dir="rtl"
-                className="w-full bg-vox-card border border-vox-border rounded-xl px-4 py-3 text-white placeholder-vox-muted text-sm focus:outline-none focus:border-vox-purple transition-colors" />
-              <input value={fullAddress} onChange={e => setFullAddress(e.target.value)} placeholder="العنوان التفصيلي *" dir="rtl"
-                className="w-full bg-vox-card border border-vox-border rounded-xl px-4 py-3 text-white placeholder-vox-muted text-sm focus:outline-none focus:border-vox-purple transition-colors" />
-              <div className="grid grid-cols-2 gap-2">
-                <input value={city} onChange={e => setCity(e.target.value)} placeholder="المدينة *" dir="rtl"
-                  className="bg-vox-card border border-vox-border rounded-xl px-4 py-3 text-white placeholder-vox-muted text-sm focus:outline-none focus:border-vox-purple transition-colors" />
-                <input value={district} onChange={e => setDistrict(e.target.value)} placeholder="الحي" dir="rtl"
-                  className="bg-vox-card border border-vox-border rounded-xl px-4 py-3 text-white placeholder-vox-muted text-sm focus:outline-none focus:border-vox-purple transition-colors" />
+      {/* Address card */}
+      <div className="flex-shrink-0 mx-4 mt-3 mb-2 p-4 rounded-2xl" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" }}>
+        <div className="flex items-start gap-2">
+          <MapPin size={16} className="text-vox-purple mt-0.5 flex-shrink-0" />
+          <div className="flex-1 min-w-0">
+            {geocoding || locating ? (
+              <div className="flex items-center gap-2">
+                <Loader2 size={13} className="animate-spin text-vox-purple" />
+                <span className="text-white/40 text-sm">جاري تحديد العنوان...</span>
               </div>
-              <button onClick={confirmNew} disabled={!fullAddress.trim() || !city.trim()}
-                className="w-full bg-gradient-to-r from-vox-purple to-vox-blue rounded-2xl py-3.5 font-bold text-white text-sm disabled:opacity-40 transition-opacity active:scale-95">
-                تأكيد العنوان
-              </button>
-            </div>
-          )}
+            ) : (
+              <p className="text-white text-sm font-semibold leading-relaxed">
+                {address || "اضغط على الخريطة لتحديد الموقع"}
+              </p>
+            )}
+            {city && <p className="text-white/40 text-xs mt-0.5">{city}{district ? ` · ${district}` : ""}</p>}
+          </div>
         </div>
+      </div>
+
+      {/* Label selector */}
+      <div className="flex-shrink-0 px-4 mb-3">
+        <div className="flex gap-2">
+          {["منزل", "عمل", "آخر"].map(l => (
+            <button key={l} onClick={() => setLabel(l)}
+              className="flex-1 py-2 rounded-xl text-sm font-bold transition-all"
+              style={label === l
+                ? { background: "rgba(109,40,255,0.8)", color: "#fff" }
+                : { background: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.4)", border: "1px solid rgba(255,255,255,0.08)" }}>
+              {l}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Confirm button */}
+      <div className="flex-shrink-0 px-4 pb-10">
+        <button
+          onClick={confirm}
+          disabled={!lat || !lng || geocoding || saving}
+          className="w-full py-4 rounded-2xl font-black text-base text-white transition-all active:scale-95 disabled:opacity-40"
+          style={{ background: "linear-gradient(135deg,#6D28FF,#A855F7)" }}
+        >
+          {saving ? "جاري الحفظ..." : "تأكيد الموقع"}
+        </button>
       </div>
     </div>
   );

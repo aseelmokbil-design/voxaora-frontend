@@ -16,11 +16,11 @@ interface Options {
   enabled: boolean;
   onNewOrder: (order: DriverAvailableOrder) => void;
   onOrderTaken: (orderId: string) => void;
-  onLocationInterval?: number; // ms, default 8000
+  onLocationInterval?: number; // ms, default 5000
 }
 
 export function useDriverWS({
-  token, enabled, onNewOrder, onOrderTaken, onLocationInterval = 8000,
+  token, enabled, onNewOrder, onOrderTaken, onLocationInterval = 5000,
 }: Options) {
   const wsRef  = useRef<WebSocket | null>(null);
   const pingRef = useRef<ReturnType<typeof setInterval> | null>(null);
